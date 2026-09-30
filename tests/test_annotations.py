@@ -1,17 +1,12 @@
-"""Every tool declares itself read-only, and says whether it opens a socket.
+"""Every tool declares what it does to the world, and the four families stay honest.
 
-Twelve tools, all lookups, and not one writes anything a caller can observe.
-That is worth declaring rather than leaving to be inferred: an unannotated
-read-only server and an unannotated server full of delete tools are
-indistinguishable in the manifest.
+v1 was twelve read-only lookups. v2 has twenty tools in four families, and the
+manifest alone must let a careful client tell them apart:
 
-THE OPEN-WORLD SPLIT IS EXACTLY HALF, and it is the part that had to be checked
-rather than assumed. Six tools query the local SQLite cache and never open a
-socket; the other six call LeakCheck, Ahmia, or HIBP. Marking all twelve
-open-world would have been the easy uniform answer and would have been wrong
-about half the surface. The cache is refreshed by a separate sync process, so
-the DATA originates externally -- but these tools do not go and get it, and
-that is what the hint describes.
+* intelligence: read-only; cache tools are closed-world, the two HIBP tools open-world;
+* host detection: read-only, closed-world (the host agent reads the machine);
+* response: NOT read-only and destructive (once approved);
+* governance: not read-only (rollback requests), not destructive.
 """
 
 from __future__ import annotations
@@ -22,18 +17,14 @@ import pytest
 
 from mcp_threatintel import server
 
-#: Query the local SQLite cache. Verified by reading each body for a `connect`
-#: call rather than inferred from the name -- `lookup_ioc` and `check_breach`
-#: read alike and land on opposite sides.
 LOCAL = {
     "lookup_ioc", "search_threats", "get_recent_threats", "lookup_cve",
     "get_feed_status", "search_pulses",
 }
-#: Call out to LeakCheck, Ahmia, or HIBP.
-REMOTE = {
-    "check_breach", "check_domain_breaches", "search_darkweb",
-    "check_password_breach", "check_email_breaches", "get_latest_breach",
-}
+REMOTE = {"check_password_breach", "get_latest_breach"}
+HOST = {"scan_network_connections", "scan_files", "check_auth_logs", "scan_host"}
+ACTIONS = {"block_ip", "sinkhole_domain", "quarantine_file", "kill_process", "block_feed_c2"}
+GOVERNANCE = {"list_actions", "get_action_status", "rollback_action"}
 
 
 @pytest.fixture(scope="module")
@@ -42,38 +33,36 @@ def tools():
     return {t.name: t for t in asyncio.run(server.mcp.list_tools())}
 
 
-def test_the_expected_twelve_are_present(tools):
-    """Guards the guard: an empty manifest would pass everything below."""
-    assert set(tools) == LOCAL | REMOTE
+def test_the_expected_twenty_are_present(tools):
+    assert set(tools) == LOCAL | REMOTE | HOST | ACTIONS | GOVERNANCE
+    assert len(tools) == 20
 
 
 def test_every_tool_is_annotated(tools):
     assert sorted(n for n, t in tools.items() if t.annotations is None) == []
 
 
-def test_every_tool_is_read_only(tools):
-    """A write tool added later fails here first, which is the point."""
-    assert sorted(n for n, t in tools.items() if not t.annotations.readOnlyHint) == []
-
-
-def test_nothing_claims_to_be_destructive(tools):
-    assert sorted(n for n, t in tools.items() if t.annotations.destructiveHint) == []
-
-
-def test_cache_backed_tools_do_not_claim_an_open_world(tools):
-    wrong = sorted(n for n in LOCAL if tools[n].annotations.openWorldHint is not False)
+def test_intelligence_and_detection_are_read_only(tools):
+    wrong = sorted(n for n in LOCAL | REMOTE | HOST if not tools[n].annotations.read_only_hint)
     assert wrong == []
 
 
-def test_feed_backed_tools_do(tools):
-    wrong = sorted(n for n in REMOTE if tools[n].annotations.openWorldHint is not True)
+def test_response_tools_declare_they_are_destructive(tools):
+    wrong = sorted(
+        n for n in ACTIONS
+        if tools[n].annotations.read_only_hint or not tools[n].annotations.destructive_hint
+    )
     assert wrong == []
 
 
-def test_the_split_is_not_collapsed_one_way(tools):
-    """Guard against a classification bug that marks everything the same.
+def test_only_response_tools_are_destructive(tools):
+    assert {n for n, t in tools.items() if t.annotations.destructive_hint} == ACTIONS
 
-    Both directions must be non-empty, or the split is decorative.
-    """
-    open_world = {n for n, t in tools.items() if t.annotations.openWorldHint}
-    assert open_world and open_world != set(tools)
+
+def test_only_hibp_is_open_world(tools):
+    assert {n for n, t in tools.items() if t.annotations.open_world_hint} == REMOTE
+
+
+def test_there_is_no_approve_tool(tools):
+    """Approval must stay outside the model's reach (spec §4.D / §11)."""
+    assert not [n for n in tools if "approve" in n]

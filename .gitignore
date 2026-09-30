@@ -7,3 +7,7 @@ __pycache__/
 
 # Per-host compose override (homelab uses host networking; not for public repo)
 docker-compose.override.yml
+
+# Local runtime
+.venv/
+data/

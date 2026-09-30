@@ -1,0 +1,190 @@
+"""ResponderDB: actions, append-only audit log and allowlist (responder.db).
+
+Owned by the host agent. The MCP server never opens this file; it only talks
+to the agent over the agent channel.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL,
+    target TEXT NOT NULL,
+    params_json TEXT NOT NULL DEFAULT '{}',
+    reason TEXT,
+    requested_by TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    approved_by TEXT,
+    approved_at TEXT,
+    executed_at TEXT,
+    result TEXT,
+    rollback_of INTEGER REFERENCES actions(id),
+    expires_at TEXT,
+    dry_run INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    event TEXT NOT NULL,
+    action_id INTEGER,
+    details_json TEXT NOT NULL DEFAULT '{}'
+);
+
+-- Append-only: the database itself refuses to rewrite history.
+CREATE TRIGGER IF NOT EXISTS audit_log_no_update BEFORE UPDATE ON audit_log
+BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
+BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
+
+CREATE TABLE IF NOT EXISTS allowlist (
+    value TEXT NOT NULL,
+    type TEXT NOT NULL,
+    comment TEXT,
+    UNIQUE(value, type)
+);
+"""
+
+
+_UPDATABLE = {
+    "status", "params_json", "approved_by", "approved_at", "executed_at", "result", "expires_at",
+}
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class ResponderDB:
+    """Thin, thread-safe wrapper around one sqlite3 connection."""
+
+    def __init__(self, path: str | Path):
+        if str(path) != ":memory:":
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        if str(path) != ":memory:":
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.executescript(SCHEMA)
+        self._lock = threading.Lock()
+
+    def close(self) -> None:
+        self._conn.close()
+
+    # --- actions ---
+
+    def insert_action(self, *, type: str, target: str, params: dict, reason: str,
+                      requested_by: str, status: str, dry_run: bool,
+                      rollback_of: int | None = None, result: dict | None = None) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO actions (type, target, params_json, reason, requested_by,
+                   status, created_at, rollback_of, dry_run, result)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (type, target, json.dumps(params), reason, requested_by, status,
+                 now_iso(), rollback_of, int(dry_run),
+                 json.dumps(result) if result is not None else None),
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
+    def update_action(self, action_id: int, **fields) -> None:
+        if not fields:
+            return
+        if "result" in fields and not isinstance(fields["result"], (str, type(None))):
+            fields["result"] = json.dumps(fields["result"])
+        if "params" in fields:
+            fields["params_json"] = json.dumps(fields.pop("params"))
+        bad = set(fields) - _UPDATABLE
+        if bad:
+            raise ValueError(f"not updatable: {sorted(bad)}")
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        with self._lock:
+            self._conn.execute(f"UPDATE actions SET {cols} WHERE id = ?", (*fields.values(), action_id))
+            self._conn.commit()
+
+    def get_action(self, action_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM actions WHERE id = ?", (action_id,)).fetchone()
+        return _action(row) if row else None
+
+    def list_actions(self, status: str = "", limit: int = 50) -> list[dict]:
+        with self._lock:
+            if status:
+                rows = self._conn.execute(
+                    "SELECT * FROM actions WHERE status = ? ORDER BY id DESC LIMIT ?", (status, limit)
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM actions ORDER BY id DESC LIMIT ?", (limit,)
+                ).fetchall()
+        return [_action(r) for r in rows]
+
+    def due_for_expiry(self, now: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM actions WHERE status = 'executed' AND expires_at IS NOT NULL AND expires_at <= ?",
+                (now,),
+            ).fetchall()
+        return [_action(r) for r in rows]
+
+    # --- audit ---
+
+    def append_audit(self, actor: str, event: str, action_id: int | None = None, **details) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO audit_log (ts, actor, event, action_id, details_json) VALUES (?, ?, ?, ?, ?)",
+                (now_iso(), actor, event, action_id, json.dumps(details, default=str)),
+            )
+            self._conn.commit()
+
+    def audit(self, action_id: int | None = None, limit: int = 100) -> list[dict]:
+        with self._lock:
+            if action_id is not None:
+                rows = self._conn.execute(
+                    "SELECT * FROM audit_log WHERE action_id = ? ORDER BY id", (action_id,)
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)
+                ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["details"] = json.loads(d.pop("details_json") or "{}")
+            out.append(d)
+        return out
+
+    # --- allowlist ---
+
+    def replace_allowlist(self, entries: list[tuple[str, str, str]]) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM allowlist")
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO allowlist (value, type, comment) VALUES (?, ?, ?)", entries
+            )
+            self._conn.commit()
+
+    def load_allowlist(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT value, type, comment FROM allowlist").fetchall()
+        return [dict(r) for r in rows]
+
+
+def _action(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    d["params"] = json.loads(d.pop("params_json") or "{}")
+    d["result"] = json.loads(d["result"]) if d.get("result") else None
+    d["dry_run"] = bool(d["dry_run"])
+    return d

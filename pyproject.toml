@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-threatintel"
-version = "0.3.0"
-description = "MCP server for threat intelligence: IOC lookups, full-text threat search, CISA KEV CVE checks, AlienVault OTX pulses, HIBP/LeakCheck breach lookups, and Ahmia dark-web search over a local SQLite cache."
+version = "0.4.0"
+description = "MCP server for threat intelligence, host detection and human-approved response: IOC lookups, CISA KEV, OTX, HIBP, host scans, firewall blocks, DNS sinkhole, quarantine and process kill through a privileged host agent."
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Pete Stergion", email = "pstergion@gmail.com" }]
 requires-python = ">=3.11"
-keywords = ["mcp", "threat-intelligence", "ioc", "cve", "otx", "cisa-kev", "claude", "security"]
+keywords = ["mcp", "threat-intelligence", "ioc", "cve", "otx", "cisa-kev", "soar", "incident-response", "security"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -29,6 +29,7 @@ dependencies = [
     "httpx>=0.28.1",
     "uvicorn>=0.49.0",
     "python-dotenv>=1.1.0",
+    "psutil>=6.0.0",
     # Pinned to an immutable commit tarball until pete-mcp-core is on PyPI.
     # Revert to "pete-mcp-core>=0.1.0" once it publishes.
     "pete-mcp-core @ https://github.com/pete-builds/pete-mcp-core/archive/60cc81ece57358b775bcf0f01d356a6ea2995790.tar.gz",
@@ -46,6 +47,8 @@ dev = [
 [project.scripts]
 mcp-threatintel = "mcp_threatintel.server:main"
 mcp-threatintel-poller = "mcp_threatintel.poller:main"
+threatintel-responder = "mcp_threatintel.responder.agent:main"
+threatintel-approve = "mcp_threatintel.responder.approve_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/pete-builds/mcp-threatintel"

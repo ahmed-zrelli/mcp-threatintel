@@ -104,22 +104,27 @@ class ThreatFoxClient(BaseClient):
         if not isinstance(iocs, list):
             iocs = []
         logger.info("threatfox: fetched %d IOCs (last %d days)", len(iocs), days)
-        return [
-            {
-                "indicator": i.get("ioc"),
+        results = []
+        for i in iocs:
+            if not i.get("ioc"):
+                continue
+            indicator, port = _split_ip_port(i["ioc"], i.get("ioc_type", ""))
+            tags = list(i.get("tags", []) or [])
+            if port:
+                tags.append(f"port:{port}")
+            results.append({
+                "indicator": indicator,
                 "type": _threatfox_type(i.get("ioc_type", "")),
                 "source": "threatfox",
                 "first_seen": i.get("first_seen_utc"),
                 "last_seen": i.get("last_seen_utc") or i.get("first_seen_utc"),
-                "tags": ",".join(i.get("tags", []) or []),
+                "tags": ",".join(tags),
                 "confidence": i.get("confidence_level"),
                 "malware_family": i.get("malware", ""),
                 "threat_type": i.get("threat_type", ""),
                 "raw_json": str(i),
-            }
-            for i in iocs
-            if i.get("ioc")
-        ]
+            })
+        return results
 
 
 class FeodoClient(BaseClient):
@@ -149,6 +154,17 @@ class FeodoClient(BaseClient):
             for i in ips
             if i.get("ip_address")
         ]
+
+
+def _split_ip_port(ioc: str, ioc_type: str) -> tuple[str, str]:
+    """Store ThreatFox ``ip:port`` IOCs under the bare IP so IP lookups match.
+
+    The port is kept separately (as a ``port:N`` tag) rather than lost.
+    """
+    if ioc_type == "ip:port" and ioc.count(":") == 1:
+        ip, port = ioc.split(":")
+        return ip, port
+    return ioc, ""
 
 
 def _threatfox_type(ioc_type: str) -> str:

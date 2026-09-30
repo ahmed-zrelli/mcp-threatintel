@@ -140,6 +140,16 @@ CREATE TABLE IF NOT EXISTS feed_sync (
     status TEXT DEFAULT 'ok',
     error_message TEXT
 );
+
+-- Lab-specific IOCs (attacker VM IP, test file hash, ...). Reloaded in full
+-- from LOCAL_IOCS_FILE by the poller; never written by the MCP server.
+CREATE TABLE IF NOT EXISTS local_iocs (
+    value TEXT NOT NULL,
+    type TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'local',
+    comment TEXT,
+    UNIQUE(value, type)
+);
 """
 
 
@@ -231,12 +241,46 @@ def rebuild_fts(conn: sqlite3.Connection) -> None:
 # --- Query helpers (used by MCP server) ---
 
 
-def lookup_indicator(conn: sqlite3.Connection, indicator: str) -> list[dict]:
-    """Look up an indicator across all sources."""
+def replace_local_iocs(conn: sqlite3.Connection, rows: list[dict]) -> int:
+    """Replace the whole local_iocs table with ``rows`` (value, type, comment)."""
+    conn.execute("DELETE FROM local_iocs")
+    conn.executemany(
+        "INSERT OR IGNORE INTO local_iocs (value, type, source, comment) VALUES (?, ?, 'local', ?)",
+        [(r["value"].strip(), r["type"].strip(), (r.get("comment") or "").strip()) for r in rows],
+    )
+    conn.commit()
+    return conn.execute("SELECT COUNT(*) FROM local_iocs").fetchone()[0]
+
+
+def lookup_local_iocs(conn: sqlite3.Connection, value: str) -> list[dict]:
+    """Find a value in the lab IOC table (case-insensitive for hashes/domains)."""
     rows = conn.execute(
-        "SELECT * FROM iocs WHERE indicator = ?", (indicator,)
+        "SELECT value, type, source, comment FROM local_iocs WHERE lower(value) = lower(?)",
+        (value.strip(),),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def lookup_indicator(conn: sqlite3.Connection, indicator: str) -> list[dict]:
+    """Look up an indicator across all sources, including lab IOCs.
+
+    Older ThreatFox rows stored IPs as ``ip:port``; the LIKE clause keeps
+    those findable by bare IP until they age out.
+    """
+    rows = conn.execute(
+        "SELECT * FROM iocs WHERE indicator = ? OR indicator LIKE ? || ':%'",
+        (indicator, indicator),
+    ).fetchall()
+    matches = [dict(r) for r in rows]
+    for local in lookup_local_iocs(conn, indicator):
+        matches.append({
+            "indicator": local["value"],
+            "type": local["type"],
+            "source": "local",
+            "threat_type": "lab_ioc",
+            "tags": local["comment"],
+        })
+    return matches
 
 
 def lookup_indicator_in_pulses(conn: sqlite3.Connection, indicator: str) -> list[dict]:
@@ -356,7 +400,13 @@ def get_db_stats(conn: sqlite3.Connection) -> dict:
     ioc_count = conn.execute("SELECT COUNT(*) FROM iocs").fetchone()[0]
     pulse_count = conn.execute("SELECT COUNT(*) FROM pulses").fetchone()[0]
     vuln_count = conn.execute("SELECT COUNT(*) FROM vulnerabilities").fetchone()[0]
-    return {"iocs": ioc_count, "pulses": pulse_count, "vulnerabilities": vuln_count}
+    local_count = conn.execute("SELECT COUNT(*) FROM local_iocs").fetchone()[0]
+    return {
+        "iocs": ioc_count,
+        "pulses": pulse_count,
+        "vulnerabilities": vuln_count,
+        "local_iocs": local_count,
+    }
 
 
 # --- Helpers ---

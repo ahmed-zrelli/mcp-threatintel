@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import asyncio
+import csv
 import logging
 import os
 import time
@@ -21,7 +22,16 @@ from dotenv import load_dotenv
 from mcp_threatintel.clients.abusech import URLhausClient, MalwareBazaarClient, ThreatFoxClient, FeodoClient
 from mcp_threatintel.clients.otx import OtxClient
 from mcp_threatintel.clients.cisa import CisaClient
-from mcp_threatintel.db import init_db, upsert_ioc, upsert_pulse, upsert_pulse_indicator, upsert_vulnerability, update_feed_sync, rebuild_fts
+from mcp_threatintel.db import (
+    init_db,
+    rebuild_fts,
+    replace_local_iocs,
+    update_feed_sync,
+    upsert_ioc,
+    upsert_pulse,
+    upsert_pulse_indicator,
+    upsert_vulnerability,
+)
 
 load_dotenv()
 
@@ -34,6 +44,22 @@ logger = logging.getLogger("threatintel.poller")
 
 DB_PATH = os.getenv("DB_PATH", "/data/threatintel.db")
 ABUSECH_API_KEY = os.getenv("ABUSECH_API_KEY", "")
+LOCAL_IOCS_FILE = os.getenv("LOCAL_IOCS_FILE", "lab/local_iocs.csv")
+
+
+def load_local_iocs(conn, path: str = LOCAL_IOCS_FILE) -> None:
+    """Reload lab IOCs (value,type,comment CSV; '#' lines ignored) into local_iocs."""
+    if not os.path.exists(path):
+        logger.info("local_iocs: %s not found, skipping", path)
+        return
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            lines = [line for line in f if line.strip() and not line.lstrip().startswith("#")]
+        rows = [r for r in csv.DictReader(lines) if r.get("value") and r.get("type")]
+        total = replace_local_iocs(conn, rows)
+        logger.info("local_iocs: loaded %d lab IOCs from %s", total, path)
+    except Exception as e:
+        logger.error("local_iocs load failed: %s", e)
 
 
 async def poll_urlhaus(conn):
@@ -166,6 +192,8 @@ async def poll_all():
     logger.info("=== Starting poll cycle ===")
     start = time.monotonic()
 
+    load_local_iocs(conn)
+
     # Poll all feeds (sequentially to be kind to rate limits)
     await poll_urlhaus(conn)
     await poll_malwarebazaar(conn)
@@ -190,7 +218,14 @@ def main():
     parser = argparse.ArgumentParser(description="Threat intel feed poller")
     parser.add_argument("--loop", action="store_true", help="Run in continuous loop")
     parser.add_argument("--interval", type=int, default=3600, help="Loop interval in seconds (default: 3600)")
+    parser.add_argument("--local-only", action="store_true", help="Only reload lab IOCs from LOCAL_IOCS_FILE, then exit")
     args = parser.parse_args()
+
+    if args.local_only:
+        conn = init_db(DB_PATH)
+        load_local_iocs(conn)
+        conn.close()
+        return
 
     if args.loop:
         logger.info("Starting poller loop (interval: %ds)", args.interval)

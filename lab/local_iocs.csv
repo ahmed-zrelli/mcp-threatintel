@@ -1,0 +1,10 @@
+# Lab IOCs, reloaded into threatintel.db (table local_iocs) on every poller cycle,
+# or immediately with:  mcp-threatintel-poller --local-only
+# Columns: value,type,comment   (type: ip, domain, hash_sha256, url)
+#
+# Phase 2 (VM lab): add the attacker (Kali) VM IP here. Private IPs can only be
+# blocked if they are listed in this file.
+value,type,comment
+9.9.9.9,ip,Scenario A - simulated C2 server (change it if Quad9 is your DNS)
+f8994855ae7bd42bf3490f416413850bc6d385a6af8f50e2685d2514b2e46f48,hash_sha256,Scenario B - lab test file (lab/create_test_files.py)
+c2.threatintel-lab.test,domain,Scenario C - simulated C2 domain
