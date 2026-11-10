@@ -32,6 +32,38 @@ from .validators import ValidationError
 
 logger = logging.getLogger("threatintel.responder.alerts")
 
+CORRELATE_MINUTES = 60   # findings sharing a key with an open incident this recent join it
+REOPEN_HOURS = 24        # a resolved incident whose indicators come back within this time is reopened
+SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+def finding_keys(finding: Finding) -> set[str]:
+    """Correlation keys: indicators, processes and campaigns a finding touches."""
+    d, keys = finding.detail, set()
+
+    def add(prefix, value):
+        if value not in (None, "", []):
+            keys.add(f"{prefix}:{str(value).lower()}")
+
+    add("ip", d.get("remote_ip") or (d.get("ip") if finding.kind.startswith("ssh_") else None))
+    add("pid", d.get("pid"))
+    add("domain", d.get("domain"))
+    for ip in d.get("answers") or []:
+        add("ip", ip)
+    add("hash", d.get("sha256"))
+    add("path", d.get("path"))
+    for ind in d.get("indicators") or []:
+        kind = {"url": "url"}.get(ind.get("type"), ind.get("type"))
+        add(kind, ind.get("value"))
+        for m in ind.get("ioc_matches") or []:
+            add("family", m.get("malware_family"))
+            add("pulse", m.get("pulse"))
+    for m in d.get("ioc_matches") or []:
+        add("family", m.get("malware_family"))
+        add("pulse", m.get("pulse"))
+    return keys
+
+
 ACTION_PARAM = {  # MCP tool argument -> action parameter
     "block_ip": "ip", "kill_process": "pid", "quarantine_file": "path", "sinkhole_domain": "domain",
 }
@@ -115,30 +147,73 @@ class AlertEngine:
         return alert_id
 
     def _is_open(self, alert: dict) -> bool:
-        """Still being handled: not resolved and at least one of its actions still pending/approved."""
+        """Still being handled: not resolved, and nothing executed/expired/rolled back yet.
+        (Actions refused by validation or rejected by a human leave it open: it is counted, not re-alerted.)"""
         if alert.get("resolution") and not str(alert["resolution"]).startswith("recommended_"):
             return False
         statuses = [a["status"] for a in (self.db.get_action(i) for i in alert["action_ids"]) if a]
-        return not statuses or any(s in ("pending", "approved") for s in statuses)
+        return not any(s in ("executed", "expired", "rolled_back") for s in statuses)
+
+    def _incident_open(self, incident: dict) -> bool:
+        return any(self._is_open(a) for a in self.db.incident_alerts(incident["id"]))
+
+    def _correlate(self, keys: set[str]) -> dict | None:
+        """Most recent incident sharing a key: open ones within CORRELATE_MINUTES, resolved ones
+        within REOPEN_HOURS (so an attack that comes back reopens its own incident)."""
+        now = datetime.now(timezone.utc)
+        horizon = (now - timedelta(hours=REOPEN_HOURS)).isoformat(timespec="seconds")
+        for inc in self.db.recent_incidents(horizon):
+            if not keys & set(inc["keys"]):
+                continue
+            age = now - datetime.fromisoformat(inc["last_seen"])
+            if age <= timedelta(minutes=CORRELATE_MINUTES) or not self._incident_open(inc):
+                return inc
+        return None
 
     def _handle(self, finding: Finding) -> int | None:
+        keys = finding_keys(finding)
+
+        # 1. Exactly the same finding, still being handled: count it, no new alert.
         prev = self.db.latest_alert(finding.key)
-        recurrence_of = None
-        if prev:
-            last = datetime.fromisoformat(prev.get("last_seen") or prev["ts"])
-            recent = datetime.now(timezone.utc) - last < timedelta(minutes=self.aggregate_minutes)
-            if recent and self._is_open(prev):
-                self.db.bump_alert(prev["id"])   # same open incident: count it, no duplicate alert
-                return None
-            # The threat came back after being handled (or after a quiet period): alert again, louder.
-            recurrence_of = prev["id"]
+        if prev and self._is_open(prev):
+            self.db.bump_alert(prev["id"])
+            if prev.get("incident_id"):
+                self.db.update_incident(prev["incident_id"])
+            return None
+
+        # 2. Which attack does it belong to?
+        incident = self._correlate(keys)
+        recurrence_of = prev["id"] if prev else None
+        if incident is None:
+            event = "new"
+        elif self._incident_open(incident):
+            event = "grew"
+            if SEVERITY_RANK[finding.severity] < SEVERITY_RANK[incident["severity"]]:
+                event = "escalated"
+        else:
+            event = "reopened"   # the attack came back after it was handled
             finding.severity = {"low": "medium", "medium": "high"}.get(finding.severity, "critical")
-            finding.title = f"RECURRING (after alert #{prev['id']}, {prev.get('resolution') or 'open'}): {finding.title}"
-            finding.detail = {**finding.detail, "recurrence_of": prev["id"],
-                              "previous_resolution": prev.get("resolution"),
-                              "previous_occurrences": prev.get("occurrences")}
+            finding.title = f"RECURRING (incident #{incident['id']} reopened): {finding.title}"
+            finding.detail = {**finding.detail, "recurrence_of": recurrence_of}
+
         actions = [self._create(tool, args) for tool, args in finding.plan]
         ids = [a["id"] for a in actions if a.get("id")]
+
+        # 3. Malware still hitting a C2 that is already blocked: contained, but the cause is still there.
+        containing = [a for a in actions if a.get("type") != "kill_process"]
+        contained = bool(containing) and all(a.get("duplicate") and a.get("status") == "executed"
+                                             for a in containing)
+        if contained and incident is not None:
+            self.db.update_incident(incident["id"], blocked_attempt=True)
+            if incident["persisting_notified"]:
+                if prev:
+                    self.db.bump_alert(prev["id"])
+                return None
+            event = "persisting"
+            finding.title = (f"CONTAINED but persisting: {finding.title} - attempts are blocked, "
+                             f"the process behind them is still running")
+            self.db.update_incident(incident["id"], persisting_notified=True)
+
         detail = {**finding.detail, "actions": [
             {k: a.get(k) for k in ("id", "type", "target", "status", "duplicate")}
             | ({"error": (a.get("result") or {}).get("error") or a.get("error")} if a.get("status") == "rejected" else {})
@@ -146,12 +221,24 @@ class AlertEngine:
         ]}
         if self.forensics:
             detail["evidence"] = collect_evidence(self.forensics, finding.kind, finding.detail)
+
+        if incident is None:
+            incident_id = self.db.insert_incident(severity=finding.severity, title=finding.title, keys=keys)
+        else:
+            incident_id = incident["id"]
+        worst = min(finding.severity, incident["severity"] if incident else finding.severity,
+                    key=lambda s: SEVERITY_RANK[s])
+        self.db.update_incident(incident_id, keys=keys, severity=worst, add_alert=True,
+                                reopened=event == "reopened")
+
         alert_id = self.db.insert_alert(key=finding.key, kind=finding.kind, severity=finding.severity,
                                         title=finding.title, detail=detail, action_ids=ids,
-                                        recurrence_of=recurrence_of)
-        self.db.append_audit("auto-detect", "alert", None, alert_id=alert_id, severity=finding.severity,
-                             title=finding.title, actions=ids)
-        logger.warning("ALERT #%d [%s] %s -> pending actions %s", alert_id, finding.severity, finding.title, ids)
+                                        recurrence_of=recurrence_of if event == "reopened" else None,
+                                        incident_id=incident_id, incident_event=event)
+        self.db.append_audit("auto-detect", "alert", None, alert_id=alert_id, incident_id=incident_id,
+                             incident_event=event, severity=finding.severity, title=finding.title, actions=ids)
+        logger.warning("ALERT #%d incident #%d (%s) [%s] %s -> actions %s", alert_id, incident_id, event,
+                       finding.severity, finding.title, ids)
         return alert_id
 
     def tick(self) -> list[int]:

@@ -39,10 +39,10 @@ logger = logging.getLogger("threatintel.responder")
 
 AGENT_OPS = {
     "ping", "scan_connections", "scan_files", "scan_auth_logs", "scan_host", "scan_dns", "scan_processes", "list_alerts",
-    "investigate_host", "related_iocs", "save_alert_report", "resolve_alert",
+    "investigate_host", "related_iocs", "save_alert_report", "resolve_alert", "list_incidents",
     "create_action", "get_action", "list_actions", "request_rollback",
 }
-ADMIN_OPS = {"ping", "list_actions", "get_action", "approve", "reject", "audit", "list_alerts"}
+ADMIN_OPS = {"ping", "list_actions", "get_action", "approve", "reject", "audit", "list_alerts", "list_incidents"}
 
 
 def summarize(action: dict) -> dict:
@@ -153,6 +153,13 @@ class HostAgent:
                 alert["actions"] = [summarize(x) for x in (self.db.get_action(i) for i in alert["action_ids"]) if x]
                 alert["detail"].pop("actions", None)
                 alert["autonomy"] = self.autonomy.status()
+                if alert.get("incident_id"):
+                    inc = self.db.get_incident(alert["incident_id"]) or {}
+                    inc["alerts"] = [{k: a.get(k) for k in ("id", "ts", "kind", "severity", "title",
+                                                             "incident_event", "occurrences", "resolution")}
+                                     for a in self.db.incident_alerts(alert["incident_id"])][-10:]
+                    inc.pop("keys", None)
+                    alert["incident"] = inc
                 return alert
             since, limit = int(p.get("since_id") or 0), max(1, min(int(p.get("limit", 20)), 200))
             wait = max(0.0, min(float(p.get("wait_s") or 0), 25.0))  # long polling for notifiers
@@ -175,6 +182,12 @@ class HostAgent:
                 a["report_summary"] = (a.get("report") or "").split("\n")[0][:200] or None
                 a.pop("report", None)
             return alerts
+        if op == "list_incidents":
+            incs = self.db.list_incidents(max(1, min(int(p.get("limit", 20)), 100)))
+            for inc in incs:
+                inc.pop("keys", None)
+                inc["open"] = self.detector._incident_open(inc)
+            return incs
         if op == "investigate_host":
             kind, value = str(p.get("kind") or ""), p.get("value")
             fx = self.detector.forensics

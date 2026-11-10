@@ -80,6 +80,8 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("alerts", help="show alerts from the always-on detection")
     p.add_argument("--limit", type=int, default=20)
     sub.add_parser("alert", help="one alert in full: evidence and investigation report").add_argument("id", type=int)
+    p = sub.add_parser("incidents", help="attacks: each incident groups the alerts of one attack")
+    p.add_argument("--limit", type=int, default=15)
     p = sub.add_parser("audit", help="show the audit log")
     p.add_argument("--id", type=int)
     p.add_argument("--limit", type=int, default=30)
@@ -118,12 +120,27 @@ def main(argv: list[str] | None = None) -> None:
             print("no alerts")
         for a in alerts:
             seen = f"  (seen {a['occurrences']}x)" if (a.get("occurrences") or 1) > 1 else ""
-            print(f"#{a['id']:<4} {a['ts']}  {a['severity'].upper():<8} {a['title']}{seen}")
+            inc = f"[incident {a['incident_id']}: {a.get('incident_event')}] " if a.get("incident_id") else ""
+            print(f"#{a['id']:<4} {a['ts']}  {a['severity'].upper():<8} {inc}{a['title']}{seen}")
             for x in a.get("actions", []):
                 print(f"        action {x['id']}: {x['type']} {x['target'][:40]} -> {x['status']}")
+    elif args.cmd == "incidents":
+        incs = _call(config, "list_incidents", limit=args.limit)
+        if not incs:
+            print("no incidents")
+        for i in incs:
+            state = "OPEN" if i["open"] else "handled"
+            extra = (f", reopened {i['reopen_count']}x" if i["reopen_count"] else "") + \
+                (f", {i['blocked_attempts']} blocked attempts" if i["blocked_attempts"] else "")
+            print(f"incident {i['id']:<4} {state:<8} {i['severity'].upper():<8} {i['alert_count']} alert(s){extra}")
+            print(f"     opened {i['opened_at']}  last seen {i['last_seen']}  - {i['title'][:90]}")
     elif args.cmd == "alert":
         a = _call(config, "list_alerts", alert_id=args.id)
         print(f"#{a['id']}  {a['ts']}  {a['severity'].upper()}  {a['title']}")
+        if a.get("incident"):
+            inc = a["incident"]
+            print(f"  incident {inc['id']} ({a.get('incident_event')}): {inc['alert_count']} alert(s), "
+                  f"reopened {inc['reopen_count']}x, {inc['blocked_attempts']} blocked attempts")
         for x in a.get("actions", []):
             print(f"  action {x['id']}: {x['type']} {x['target'][:50]} -> {x['status']}")
         for name, data in (a["detail"].get("evidence") or {}).items():

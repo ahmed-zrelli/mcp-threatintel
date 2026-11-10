@@ -418,6 +418,17 @@ async def list_alerts(since_id: int = 0, limit: int = 10, alert_id: int = 0, wai
 
 
 @mcp.tool(annotations=HOST_READ)
+async def list_incidents(limit: int = 10) -> str:
+    """Attacks: each incident groups the alerts of one attack (shared IPs, domains, hashes, processes,
+    campaign), with its state (open/handled), severity, reopen count and blocked attempts.
+
+    Args:
+        limit: Maximum number of incidents (newest first).
+    """
+    return await _agent_call("list_incidents", limit=limit)
+
+
+@mcp.tool(annotations=HOST_READ)
 async def investigate_host(kind: str, value: str) -> str:
     """Read-only investigation on the server. kind: process (value=PID: parent chain, executable hash,
     user, connections, files), file (value=path: hashes, type, owner, times, users), ip (connections,

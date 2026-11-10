@@ -134,3 +134,15 @@ def test_notifier_first_run_summarises_then_shows_only_new(tmp_path, monkeypatch
     alerts.append({"id": 4, "severity": "high", "title": "t4", "actions": []})
     asyncio.run(watcher.poll(mcp, last, SimpleNamespace(no_ai=True), jobs))
     assert shown[-1] == "alert 4" and jobs.qsize() == 1
+
+
+def test_one_notification_per_attack(monkeypatch):
+    from mcp_threatintel.watch import watcher
+
+    shown = []
+    monkeypatch.setattr(watcher, "notify", lambda title, lines: shown.append(title) or True)
+    base = {"severity": "high", "title": "t", "actions": [], "incident_id": 7}
+    watcher.announce({**base, "id": 1, "incident_event": "new"}, toast=True)
+    watcher.announce({**base, "id": 2, "incident_event": "grew"}, toast=True)        # same attack: silent
+    watcher.announce({**base, "id": 3, "incident_event": "reopened"}, toast=True)
+    assert len(shown) == 2 and "NEW ATTACK incident #7" in shown[0] and "ATTACK BACK" in shown[1]

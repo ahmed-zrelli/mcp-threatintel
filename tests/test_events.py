@@ -131,25 +131,69 @@ def test_repeat_while_open_is_counted_not_realerted(agent):  # noqa: F811
     assert agent.db.get_alert(first)["occurrences"] == 2
 
 
-def test_repeat_after_resolution_raises_a_louder_recurring_alert(agent):  # noqa: F811
+def test_repeat_after_resolution_reopens_the_same_incident(agent):  # noqa: F811
     eng = agent.detector
     [first] = eng.process_event(("report", _dns_report()))
     agent.config.autonomy = True
     agent.autonomy.resolve(first, "execute", "Lab C2 domain confirmed, sinkhole it.")
     [second] = eng.process_event(("report", _dns_report()))            # attacked again right after
-    alert = agent.db.get_alert(second)
-    assert alert["recurrence_of"] == first and alert["title"].startswith("RECURRING (after alert #")
-    assert alert["severity"] == "critical"                             # was high
-    assert alert["detail"]["previous_resolution"] == "executed"
+    a1, a2 = agent.db.get_alert(first), agent.db.get_alert(second)
+    assert a2["incident_id"] == a1["incident_id"] and a2["incident_event"] == "reopened"
+    assert a2["title"].startswith(f"RECURRING (incident #{a1['incident_id']} reopened)")
+    assert a2["severity"] == "critical" and a2["recurrence_of"] == first
+    assert agent.db.get_incident(a1["incident_id"])["reopen_count"] == 1
 
 
-def test_repeat_after_a_quiet_period_alerts_again(agent):  # noqa: F811
+def test_same_open_attack_is_counted_even_after_a_quiet_period(agent):  # noqa: F811
     eng = agent.detector
     [first] = eng.process_event(("report", _dns_report()))
     agent.db._conn.execute("UPDATE alerts SET last_seen = '2000-01-01T00:00:00+00:00' WHERE id = ?", (first,))
     agent.db._conn.commit()
-    [second] = eng.process_event(("report", _dns_report()))
-    assert agent.db.get_alert(second)["recurrence_of"] == first
+    assert eng.process_event(("report", _dns_report())) == []           # still unhandled: one alert, counted
+    assert agent.db.get_alert(first)["occurrences"] == 2
+
+
+def test_findings_of_one_attack_share_one_incident(agent):  # noqa: F811
+    eng = agent.detector
+    # DNS lookup returns 45.1.2.3, then a connection to 45.1.2.3: same attack
+    dns = {"dns": {"malicious": [{"domain": "c2.lab.test", "lookups": 1, "answers": ["45.1.2.3"],
+                                  "ioc_matches": [{"source": "local"}]}]}}
+    conn = {"connections": {"malicious": [{"remote_ip": "45.1.2.3", "remote_port": 443, "pid": None,
+                                           "process": "curl", "active": True,
+                                           "ioc_matches": [{"source": "feodo", "malware_family": "qakbot"}]}]}}
+    [a] = eng.process_event(("report", dns))
+    [b] = eng.process_event(("report", conn))
+    A, B = agent.db.get_alert(a), agent.db.get_alert(b)
+    assert A["incident_id"] == B["incident_id"]
+    assert A["incident_event"] == "new" and B["incident_event"] == "escalated"   # high -> critical
+    inc = agent.db.get_incident(A["incident_id"])
+    assert inc["alert_count"] == 2 and inc["severity"] == "critical"
+    # an unrelated attack is a separate incident
+    other = {"dns": {"malicious": [{"domain": "other.example", "lookups": 1, "answers": [],
+                                    "ioc_matches": [{"source": "threatfox"}]}]}}
+    [c] = eng.process_event(("report", other))
+    assert agent.db.get_alert(c)["incident_id"] != A["incident_id"]
+    assert agent.db.get_alert(c)["incident_event"] == "new"
+
+
+def test_blocked_attempts_notify_once_then_count(agent):  # noqa: F811
+    eng = agent.detector
+    conn = {"connections": {"malicious": [{"remote_ip": "45.1.2.3", "remote_port": 443, "pid": 777,
+                                           "process": "beacon", "active": True,
+                                           "ioc_matches": [{"source": "feodo"}]}]}}
+    [first] = eng.process_event(("report", conn))
+    for a in agent.db.get_alert(first)["action_ids"]:
+        act = agent.db.get_action(a)
+        if act["type"] == "block_ip":
+            agent.manager.approve(a, "analyst:alice")
+            agent.manager.transition(a, "executed", "responder")
+    conn["connections"]["malicious"][0]["pid"] = 778      # malware retries from a new process
+    [second] = eng.process_event(("report", conn))
+    s2 = agent.db.get_alert(second)
+    assert s2["incident_event"] == "persisting" and s2["title"].startswith("CONTAINED but persisting")
+    conn["connections"]["malicious"][0]["pid"] = 779
+    assert eng.process_event(("report", conn)) == []        # later attempts only counted
+    assert agent.db.get_incident(s2["incident_id"])["blocked_attempts"] >= 2
 
 
 def test_redropped_file_gets_a_new_quarantine_action(agent, config):  # noqa: F811
@@ -177,3 +221,10 @@ def test_collectors_react_again_after_a_short_gap():
     dns.handle_line(line, now=1010)                                     # same burst: ignored
     dns.handle_line(line, now=1010 + REPEAT_GAP_S + 1)                  # attack repeated later: reported
     assert seen == ["c2.lab.test", "c2.lab.test"]
+
+
+def test_list_incidents_view(agent):  # noqa: F811
+    agent.detector.process_event(("report", _dns_report()))
+    resp = asyncio.run(agent.handle_admin({"op": "list_incidents", "params": {}, "token": "admin-token-for-tests"}))
+    [inc] = resp["data"]
+    assert inc["open"] is True and inc["alert_count"] == 1 and "keys" not in inc

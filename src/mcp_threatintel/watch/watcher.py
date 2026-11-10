@@ -97,14 +97,24 @@ async def llm_available(url: str) -> bool:
         return False
 
 
+#: Incident events that deserve a notification. "grew" (another finding of an attack you were already
+#: told about) is logged and investigated, but does not notify again: one notification per attack.
+NOTIFY_EVENTS = {None, "new", "reopened", "escalated", "persisting"}
+EVENT_LABEL = {"new": "NEW ATTACK", "reopened": "ATTACK BACK", "escalated": "ESCALATED",
+               "persisting": "STILL ACTIVE", "grew": "same attack"}
+
+
 def announce(alert: dict, toast: bool) -> None:
     """Instant part: the notification as soon as the server raised the alert."""
     actions = alert.get("actions") or []
     sev = alert.get("severity", "?").upper()
-    if toast:
+    event = alert.get("incident_event")
+    inc = f"incident #{alert['incident_id']} " if alert.get("incident_id") else ""
+    label = EVENT_LABEL.get(event, "")
+    if toast and event in NOTIFY_EVENTS:
         ioc = (alert.get("detail") or {}).get("ioc") or ""
-        notify(f"ThreatIntel {sev} - {alert['title']}", [ioc, approve_hint(actions)])
-    out(f"ALERT #{alert['id']} ({sev}) {alert['title']}")
+        notify(f"ThreatIntel {sev} {label} {inc}- {alert['title']}", [ioc, approve_hint(actions)])
+    out(f"ALERT #{alert['id']} ({sev}) {inc}{label}: {alert['title']}")
     for a in actions:
         out(f"    - {describe(a)}")
     out(f"    {approve_hint(actions)}")
@@ -128,6 +138,7 @@ async def investigate_alert(mcp, alert: dict, args, toast: bool) -> None:
     else:
         brief = {"alert": {k: full.get(k) for k in ("id", "ts", "kind", "severity", "title")},
                  "autonomous_mode": full.get("autonomy"),
+                 "incident": full.get("incident"),
                  "detail": {k: v for k, v in (full.get("detail") or {}).items() if k != "evidence"},
                  "actions_already_created": [{k: a.get(k) for k in ("id", "type", "target", "status")}
                                              for a in actions],
@@ -157,7 +168,7 @@ async def investigate_alert(mcp, alert: dict, args, toast: bool) -> None:
         done = [a for a in acts if a.get("status") in ("approved", "executed")]
         still = [a for a in acts if a.get("status") == "pending"]
         out(f"    RESOLUTION by {after.get('resolution_by')}: {res} - {after.get('resolution_note')}")
-        if toast and not res.startswith("recommended_"):
+        if toast and not res.startswith("recommended_") and alert.get("incident_event") in NOTIFY_EVENTS:
             title = {"executed": "Qwen resolved", "partially_executed": "Qwen partly resolved",
                      "dismissed": "Qwen dismissed", "escalated": "Qwen escalated to you"}.get(res, res)
             lines = [", ".join(f"{a['type']} {str(a['target'])[:30]}" for a in done)
@@ -165,7 +176,7 @@ async def investigate_alert(mcp, alert: dict, args, toast: bool) -> None:
             lines.append(approve_hint(still) if still else "Undo anytime: ask Qwen to roll back the action.")
             notify(f"ThreatIntel - {title} alert #{alert['id']}", lines)
             return
-    if toast:
+    if toast and alert.get("incident_event") in NOTIFY_EVENTS:
         summary = next((line.split(":", 1)[1].strip() for line in report.splitlines()
                         if line.upper().startswith("SUMMARY")), report[:180])
         notify(f"ThreatIntel - report for alert #{alert['id']}", [summary[:200], approve_hint(actions)])

@@ -60,6 +60,21 @@ CREATE TABLE IF NOT EXISTS alerts (
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_key ON alerts(key, ts);
 
+-- One incident = one attack: every alert (finding) that shares an indicator,
+-- process or campaign with it inside the correlation window joins it.
+CREATE TABLE IF NOT EXISTS incidents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    opened_at TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    title TEXT NOT NULL,
+    keys_json TEXT NOT NULL DEFAULT '[]',
+    alert_count INTEGER NOT NULL DEFAULT 0,
+    reopen_count INTEGER NOT NULL DEFAULT 0,
+    blocked_attempts INTEGER NOT NULL DEFAULT 0,
+    persisting_notified INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS allowlist (
     value TEXT NOT NULL,
     type TEXT NOT NULL,
@@ -99,7 +114,8 @@ class ResponderDB:
         for col, ddl in (("report", "TEXT"), ("report_by", "TEXT"), ("report_at", "TEXT"),
                          ("resolution", "TEXT"), ("resolution_by", "TEXT"), ("resolution_at", "TEXT"),
                          ("resolution_note", "TEXT"), ("occurrences", "INTEGER NOT NULL DEFAULT 1"),
-                         ("last_seen", "TEXT"), ("recurrence_of", "INTEGER")):
+                         ("last_seen", "TEXT"), ("recurrence_of", "INTEGER"),
+                         ("incident_id", "INTEGER"), ("incident_event", "TEXT")):
             if col not in cols:
                 self._conn.execute(f"ALTER TABLE alerts ADD COLUMN {col} {ddl}")
         self._conn.commit()
@@ -194,14 +210,15 @@ class ResponderDB:
     # --- alerts ---
 
     def insert_alert(self, *, key: str, kind: str, severity: str, title: str, detail: dict,
-                     action_ids: list[int], recurrence_of: int | None = None) -> int:
+                     action_ids: list[int], recurrence_of: int | None = None,
+                     incident_id: int | None = None, incident_event: str | None = None) -> int:
         now = now_iso()
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO alerts (ts, key, kind, severity, title, detail_json, action_ids, last_seen, "
-                "recurrence_of) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "recurrence_of, incident_id, incident_event) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (now, key, kind, severity, title, json.dumps(detail, default=str), json.dumps(action_ids),
-                 now, recurrence_of),
+                 now, recurrence_of, incident_id, incident_event),
             )
             self._conn.commit()
             return cur.lastrowid
@@ -240,6 +257,69 @@ class ResponderDB:
             row = self._conn.execute("SELECT id FROM alerts WHERE key = ? ORDER BY id DESC LIMIT 1",
                                      (key,)).fetchone()
         return self.get_alert(row["id"]) if row else None
+
+    # --- incidents ---
+
+    def insert_incident(self, *, severity: str, title: str, keys: set[str]) -> int:
+        now = now_iso()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO incidents (opened_at, last_seen, severity, title, keys_json) VALUES (?, ?, ?, ?, ?)",
+                (now, now, severity, title, json.dumps(sorted(keys))))
+            self._conn.commit()
+            return cur.lastrowid
+
+    def get_incident(self, incident_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["keys"] = json.loads(d.pop("keys_json") or "[]")
+        return d
+
+    def recent_incidents(self, since_iso: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT id FROM incidents WHERE last_seen >= ? ORDER BY id DESC",
+                                      (since_iso,)).fetchall()
+        return [self.get_incident(r["id"]) for r in rows]
+
+    def list_incidents(self, limit: int = 20) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT id FROM incidents ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [self.get_incident(r["id"]) for r in rows]
+
+    def update_incident(self, incident_id: int, *, keys: set[str] | None = None, severity: str | None = None,
+                        add_alert: bool = False, reopened: bool = False, blocked_attempt: bool = False,
+                        persisting_notified: bool = False) -> None:
+        inc = self.get_incident(incident_id)
+        if not inc:
+            return
+        fields = {"last_seen": now_iso()}
+        if keys:
+            fields["keys_json"] = json.dumps(sorted(set(inc["keys"]) | set(keys))[:500])
+        if severity:
+            fields["severity"] = severity
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        extra = []
+        if add_alert:
+            extra.append("alert_count = alert_count + 1")
+        if reopened:
+            extra.append("reopen_count = reopen_count + 1")
+        if blocked_attempt:
+            extra.append("blocked_attempts = blocked_attempts + 1")
+        if persisting_notified:
+            extra.append("persisting_notified = 1")
+        sql = "UPDATE incidents SET " + ", ".join([sets] + extra) + " WHERE id = ?"
+        with self._lock:
+            self._conn.execute(sql, (*fields.values(), incident_id))
+            self._conn.commit()
+
+    def incident_alerts(self, incident_id: int) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT id FROM alerts WHERE incident_id = ? ORDER BY id",
+                                      (incident_id,)).fetchall()
+        return [self.get_alert(r["id"]) for r in rows]
 
     def bump_alert(self, alert_id: int) -> None:
         """The same open incident was detected again: count it instead of re-alerting."""
