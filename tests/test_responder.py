@@ -451,3 +451,79 @@ def test_protocol_roundtrip_over_tcp():
 def test_protocol_refuses_non_loopback_bind():
     with pytest.raises(protocol.ProtocolError):
         asyncio.run(protocol.serve("tcp://0.0.0.0:38999", lambda r: r))
+
+
+# --- Linux / nftables (phase 2) ------------------------------------------------------
+
+
+def test_nftables_block_and_rollback_commands():
+    from mcp_threatintel.responder.backends.nftables import NftablesBackend, TIMEOUT_MARGIN_S
+
+    runner = RecordingRunner()
+    nft = NftablesBackend(runner, None, seconds_per_unit=3600)
+    nft._table_exists = lambda: True
+    state = nft.apply({"id": 5, "params": {"ip": "45.1.2.3", "ttl": 2}})
+    add = runner.calls[-1]
+    assert add[:6] == ["nft", "add", "element", "inet", "threatintel", "blocklist"]
+    assert f"45.1.2.3 timeout {2 * 3600 + TIMEOUT_MARGIN_S}s" in add[6]
+    assert 'comment "threatintel-5"' in add[6]
+    assert state["ips"] == ["45.1.2.3"]
+    nft.rollback({"id": 5, "params": {}}, state)
+    assert runner.calls[-1] == ["nft", "destroy", "element", "inet", "threatintel", "blocklist", "{ 45.1.2.3 }"]
+
+
+def test_nftables_rollback_keeps_ips_still_blocked_elsewhere():
+    from mcp_threatintel.responder.backends.nftables import NftablesBackend
+
+    runner = RecordingRunner()
+    nft = NftablesBackend(runner)
+    out = nft.rollback({"id": 1, "params": {}}, {"ips": ["45.1.2.3", "45.1.2.4"], "keep_ips": ["45.1.2.4"]})
+    assert out["removed_ips"] == ["45.1.2.3"] and out["kept_ips"] == ["45.1.2.4"]
+    assert "45.1.2.4" not in runner.calls[-1][-1]
+
+
+def test_nftables_missing_table_without_ruleset_fails_loudly():
+    from mcp_threatintel.responder.backends.base import BackendError
+    from mcp_threatintel.responder.backends.nftables import NftablesBackend
+
+    nft = NftablesBackend(RecordingRunner(), None)
+    nft._table_exists = lambda: False
+    with pytest.raises(BackendError, match="missing"):
+        nft.apply({"id": 1, "params": {"ip": "45.1.2.3"}})
+
+
+def test_overlapping_blocks_rollback_keeps_the_other(agent, backend):
+    a1 = call(agent, "agent", "create_action", type="block_ip", params={"ip": "45.1.2.3"}, reason="x")["data"]
+    a2 = call(agent, "agent", "create_action", type="block_feed_c2", params={"feed": "feodo"}, reason="x")["data"]
+    for a in (a1, a2):
+        call(agent, "admin", "approve", id=a["id"], actor="alice")
+    asyncio.run(agent.process_approved())
+    state = agent._rollback_state(agent.db.get_action(a1["id"]))
+    assert "45.1.2.3" in state["keep_ips"]  # still needed by the feed block
+
+
+def test_prepare_host_reapplies_active_blocks(config):
+    from mcp_threatintel.responder.backends.nftables import NftablesBackend
+
+    runner = RecordingRunner()
+    nft = NftablesBackend(runner)
+    nft._table_exists = lambda: True
+    rec = RecordingBackend()
+    real = {"block_ip": nft, "block_feed_c2": nft, "sinkhole_domain": rec, "quarantine_file": rec, "kill_process": rec}
+    config.dry_run = False
+    a = HostAgent(config, admin_token=ADMIN_TOKEN, discover=False, backends={True: real, False: real})
+    act = call(a, "agent", "create_action", type="block_ip", params={"ip": "45.1.2.3", "ttl": 1}, reason="x")["data"]
+    call(a, "admin", "approve", id=act["id"], actor="alice")
+    asyncio.run(a.process_approved())
+    runner.calls.clear()
+    a.prepare_host()  # simulates an agent start after a reboot
+    assert any(c[:3] == ["nft", "add", "element"] and "45.1.2.3" in c[-1] for c in runner.calls)
+    assert any(e["event"] == "blocks_restored" for e in a.db.audit())
+    a.db.close()
+
+
+def test_nft_ruleset_template_is_valid_shape():
+    text = (Path(__file__).resolve().parent.parent / "deploy" / "threatintel.nft").read_text()
+    assert "@MCP_CLIENTS@" in text and "table inet threatintel {" in text
+    assert "set blocklist" in text and "flags timeout" in text
+    assert "tcp dport 3707 ip saddr != @mcp_clients" in text

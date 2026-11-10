@@ -1,43 +1,53 @@
+# mcp-threatintel v2 on the protected Ubuntu server.
+#
+# Two unprivileged containers (non-root UID 1000, one image):
+#   mcp-threatintel     MCP server on :3707, reachable from the analyst PC only
+#                       (nftables table inet threatintel, deploy/threatintel.nft)
+#   threatintel-poller  hourly sync of abuse.ch / OTX / CISA KEV into the cache
+#
+# The privileged host agent is NOT a container: it runs as the systemd service
+# threatintel-responder and is the only component that changes the host.
+# The MCP container reaches it through /run/threatintel/agent.sock (group
+# threatintel, given to the container with group_add). The admin socket lives
+# in /run/threatintel-admin, which is never mounted here.
+#
+# Install everything with: sudo bash scripts/ubuntu/setup-ubuntu.sh
+
 services:
   mcp-threatintel:
-    # Pull the published image by default. To build locally instead, comment
-    # out `image:` and uncomment `build: .`. The poller below shares this image.
-    image: ghcr.io/pete-builds/mcp-threatintel:0.3.0
-    # build: .
+    build: .
+    image: mcp-threatintel:v2
     container_name: mcp-threatintel
     restart: unless-stopped
-    ports:
-      - "${FASTMCP_PORT:-3707}:3707"
+    network_mode: host
     env_file:
       - .env
     environment:
       - FASTMCP_HOST=0.0.0.0
       - FASTMCP_PORT=3707
-      - TZ=${TZ:-America/New_York}
+      - DB_PATH=/data/threatintel.db
+      - AGENT_ADDR=unix:///run/threatintel/agent.sock
+      - TZ=${TZ:-UTC}
     volumes:
-      - threatintel-data:/data
-    networks:
-      - threatintel-net
+      - ${THREATINTEL_DATA:-/var/lib/threatintel/data}:/data
+      - /run/threatintel:/run/threatintel
+    group_add:
+      - "${THREATINTEL_GID:?THREATINTEL_GID missing from .env, run scripts/ubuntu/setup-ubuntu.sh}"
 
   threatintel-poller:
-    # Shares the same published image as mcp-threatintel above (built once from
-    # this repo). To build locally instead, comment out `image:` / uncomment `build: .`.
-    image: ghcr.io/pete-builds/mcp-threatintel:0.3.0
-    # build: .
+    image: mcp-threatintel:v2
     container_name: threatintel-poller
     restart: unless-stopped
+    network_mode: host
     env_file:
       - .env
     environment:
-      - TZ=${TZ:-America/New_York}
+      - DB_PATH=/data/threatintel.db
+      - LOCAL_IOCS_FILE=/app/lab/local_iocs.csv
+      - TZ=${TZ:-UTC}
     volumes:
-      - threatintel-data:/data
-    networks:
-      - threatintel-net
+      - ${THREATINTEL_DATA:-/var/lib/threatintel/data}:/data
+      - ./lab:/app/lab:ro
     entrypoint: ["mcp-threatintel-poller", "--loop", "--interval", "3600"]
-
-volumes:
-  threatintel-data:
-
-networks:
-  threatintel-net:
+    depends_on:
+      - mcp-threatintel

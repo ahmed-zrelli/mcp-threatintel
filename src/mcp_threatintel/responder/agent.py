@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 
 from .actions import ActionManager, TransitionError
 from .backends import BackendError, CommandRunner, build_backends
+from .backends.nftables import NftablesBackend
 from .config import ResponderConfig
 from .iocs import IocIndex
 from .protocol import serve
@@ -192,7 +193,7 @@ class HostAgent:
     async def _execute_rollback(self, action: dict) -> None:
         original = self.db.get_action(action["rollback_of"])
         backend = self.backends[original["dry_run"]][original["type"]]
-        state = (original.get("result") or {}).get("state") or {}
+        state = self._rollback_state(original)
         try:
             result = await asyncio.to_thread(backend.rollback, original, state)
         except Exception as e:
@@ -203,13 +204,50 @@ class HostAgent:
         self.manager.transition(original["id"], "rolled_back", "responder",
                                 result={"state": state, "rolled_back_by": action["id"]})
 
+    def _rollback_state(self, action: dict) -> dict:
+        """Saved backend state, plus the IPs another executed block still needs."""
+        state = dict((action.get("result") or {}).get("state") or {})
+        if action["type"] in ("block_ip", "block_feed_c2"):
+            keep: set[str] = set()
+            for other in self.db.list_actions("executed", limit=1000):
+                if other["id"] != action["id"] and other["type"] in ("block_ip", "block_feed_c2")                         and other["dry_run"] == action["dry_run"]:
+                    p = other["params"]
+                    keep.update(p.get("ips") or [p.get("ip")])
+            state["keep_ips"] = sorted(ip for ip in keep if ip)
+        return state
+
+    def prepare_host(self) -> None:
+        """Linux: make sure the nftables table exists and re-apply blocks that are
+        still valid (the kernel set is empty after a reboot)."""
+        firewall = self.backends[False].get("block_ip")
+        if not isinstance(firewall, NftablesBackend):
+            return
+        try:
+            firewall.ensure_table()
+        except BackendError as e:
+            logger.error("nftables not ready: %s", e)
+            self.db.append_audit("responder", "nftables_unavailable", None, error=str(e))
+            return
+        now = datetime.now(timezone.utc)
+        restored = 0
+        for action in self.db.list_actions("executed", limit=1000):
+            if action["dry_run"] or action["type"] not in ("block_ip", "block_feed_c2") or not action["expires_at"]:
+                continue
+            left = (datetime.fromisoformat(action["expires_at"]) - now).total_seconds()
+            if left > 0:
+                firewall.reapply(action, int(left))
+                restored += 1
+        if restored:
+            self.db.append_audit("responder", "blocks_restored", None, count=restored)
+            logger.info("re-applied %d active block(s) after start", restored)
+
     async def expire(self) -> None:
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         for action in self.db.due_for_expiry(now):
             if action["id"] in self._expiry_failures:
                 continue
             backend = self.backends[action["dry_run"]][action["type"]]
-            state = (action.get("result") or {}).get("state") or {}
+            state = self._rollback_state(action)
             try:
                 await asyncio.to_thread(backend.rollback, action, state)
             except Exception as e:
@@ -221,8 +259,11 @@ class HostAgent:
             logger.info("action %s expired: %s", action["id"], action["target"])
 
     async def run(self) -> None:
-        agent_srv = await serve(self.config.agent_addr, self.handle_agent, unix_mode=0o660)
-        admin_srv = await serve(self.config.admin_addr, self.handle_admin, unix_mode=0o600)
+        await asyncio.to_thread(self.prepare_host)
+        agent_srv = await serve(self.config.agent_addr, self.handle_agent, unix_mode=0o660,
+                                unix_group=self.config.agent_socket_group)
+        admin_srv = await serve(self.config.admin_addr, self.handle_admin, unix_mode=0o660,
+                                unix_group=self.config.admin_socket_group)
         self.db.append_audit("responder", "started", None, dry_run=self.config.dry_run,
                              agent_addr=self.config.agent_addr, admin_addr=self.config.admin_addr)
         logger.info("threatintel-responder up: agent=%s admin=%s dry_run=%s allowlist=%d entries",

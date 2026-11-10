@@ -18,7 +18,8 @@ __all__ = ["BackendError", "CommandRunner", "ResponseBackend", "build_backends"]
 def build_backends(config: ResponderConfig, runner: CommandRunner | None = None) -> dict[str, ResponseBackend]:
     runner = runner or CommandRunner(config.dry_run)
     firewall: ResponseBackend = (
-        WindowsFirewallBackend(runner) if sys.platform == "win32" else NftablesBackend(runner)
+        WindowsFirewallBackend(runner) if sys.platform == "win32"
+        else NftablesBackend(runner, config.nft_ruleset_file, config.ttl_seconds_per_unit)
     )
     return {
         "block_ip": firewall,

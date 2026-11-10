@@ -16,11 +16,16 @@ if IS_WINDOWS:
     _HOSTS = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "drivers" / "etc" / "hosts"
     _AGENT_ADDR = "tcp://127.0.0.1:3710"
     _ADMIN_ADDR = "tcp://127.0.0.1:3711"
+    _ADMIN_TOKEN = None  # derived from data_dir (RESPONDER_DATA_DIR)
 else:
-    _DATA_DIR = Path("/var/lib/threatintel")
+    # Linux layout (scripts/ubuntu/setup-ubuntu.sh). The two sockets live in
+    # separate directories so the MCP container can be given the agent one
+    # without ever seeing the admin one.
+    _DATA_DIR = Path("/var/lib/threatintel/responder")
     _HOSTS = Path("/etc/hosts")
     _AGENT_ADDR = "unix:///run/threatintel/agent.sock"
-    _ADMIN_ADDR = "unix:///run/threatintel/admin.sock"
+    _ADMIN_ADDR = "unix:///run/threatintel-admin/admin.sock"
+    _ADMIN_TOKEN = Path("/etc/threatintel/admin.token")
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -42,7 +47,7 @@ class ResponderConfig:
     admin_addr: str = _ADMIN_ADDR
     agent_token: str = ""
     data_dir: Path = _DATA_DIR
-    admin_token_file: Path = _DATA_DIR / "admin.token"
+    admin_token_file: Path = _ADMIN_TOKEN or _DATA_DIR / "admin.token"
     responder_db: Path = _DATA_DIR / "responder.db"
     ioc_db: Path = Path("/data/threatintel.db")
     quarantine_dir: Path = _DATA_DIR / "quarantine"
@@ -54,6 +59,10 @@ class ResponderConfig:
     ttl_unit: str = "hours"  # "minutes" is handy for testing expiry
     auth_fail_threshold: int = 5
     max_results: int = 10
+    # Linux: groups that may use each Unix socket (agent: MCP container; admin: analyst)
+    agent_socket_group: str = "threatintel"
+    admin_socket_group: str = "threatintel-admin"
+    nft_ruleset_file: Path | None = None
 
     @property
     def ttl_seconds_per_unit(self) -> int:
@@ -69,7 +78,7 @@ class ResponderConfig:
             admin_addr=os.getenv("ADMIN_ADDR", _ADMIN_ADDR),
             agent_token=os.getenv("AGENT_TOKEN", "").strip(),
             data_dir=data_dir,
-            admin_token_file=Path(os.getenv("ADMIN_TOKEN_FILE", str(data_dir / "admin.token"))),
+            admin_token_file=Path(os.getenv("ADMIN_TOKEN_FILE", str(_ADMIN_TOKEN or data_dir / "admin.token"))),
             responder_db=Path(os.getenv("RESPONDER_DB", str(data_dir / "responder.db"))),
             ioc_db=Path(os.getenv("DB_PATH", "/data/threatintel.db")),
             quarantine_dir=Path(os.getenv("QUARANTINE_DIR", str(data_dir / "quarantine"))),
@@ -81,4 +90,7 @@ class ResponderConfig:
             ttl_unit=os.getenv("BLOCK_TTL_UNIT", "hours").strip().lower(),
             auth_fail_threshold=int(os.getenv("AUTH_FAIL_THRESHOLD", "5")),
             max_results=int(os.getenv("SCAN_MAX_RESULTS", "10")),
+            agent_socket_group=os.getenv("AGENT_SOCKET_GROUP", "threatintel"),
+            admin_socket_group=os.getenv("ADMIN_SOCKET_GROUP", "threatintel-admin"),
+            nft_ruleset_file=Path(os.environ["NFT_RULESET_FILE"]) if os.getenv("NFT_RULESET_FILE") else None,
         )

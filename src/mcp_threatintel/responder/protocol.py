@@ -33,8 +33,13 @@ def parse_addr(addr: str) -> tuple[str, str, int | None]:
     raise ProtocolError(f"address must start with tcp:// or unix://, got {addr!r}")
 
 
-async def serve(addr: str, handler, *, unix_mode: int = 0o660) -> asyncio.base_events.Server:
-    """Start a listener; ``handler(dict) -> dict`` is awaited per request line."""
+async def serve(addr: str, handler, *, unix_mode: int = 0o660, unix_group: str | None = None) -> asyncio.base_events.Server:
+    """Start a listener; ``handler(dict) -> dict`` is awaited per request line.
+
+    For a Unix socket, ``unix_group`` (if it exists) becomes the group of both
+    the socket and its directory, and the directory is made 0750: only root
+    and that group can reach the socket at all.
+    """
 
     async def on_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
@@ -65,12 +70,29 @@ async def serve(addr: str, handler, *, unix_mode: int = 0o660) -> asyncio.base_e
             raise ProtocolError("refusing to expose the agent on a non-loopback address")
         return await asyncio.start_server(on_client, host, port, limit=MAX_LINE)
     path = host
+    directory = os.path.dirname(path)
     if os.path.exists(path):
         os.unlink(path)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(directory, exist_ok=True)
     server = await asyncio.start_unix_server(on_client, path, limit=MAX_LINE)
     os.chmod(path, unix_mode)
+    gid = _group_id(unix_group)
+    if gid is not None:
+        for p in (directory, path):
+            os.chown(p, -1, gid)
+        os.chmod(directory, 0o750)
     return server
+
+
+def _group_id(name: str | None) -> int | None:
+    if not name or os.name == "nt":
+        return None
+    import grp
+
+    try:
+        return grp.getgrnam(name).gr_gid
+    except KeyError:
+        return None
 
 
 async def _send(writer: asyncio.StreamWriter, payload: dict) -> None:

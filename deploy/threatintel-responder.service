@@ -1,0 +1,27 @@
+[Unit]
+Description=mcp-threatintel host agent (privileged responder)
+Documentation=file:///opt/threatintel/README.md
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/threatintel/responder.env
+ExecStart=/opt/threatintel/venv/bin/threatintel-responder
+WorkingDirectory=/var/lib/threatintel/responder
+Restart=on-failure
+RestartSec=3
+
+# Socket directories. Preserved across restarts so the bind mount of
+# /run/threatintel inside the MCP container keeps pointing at a live directory.
+# The agent sets their group (threatintel / threatintel-admin) and mode 0750.
+RuntimeDirectory=threatintel threatintel-admin
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+
+UMask=0027
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

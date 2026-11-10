@@ -10,3 +10,9 @@ dist/
 build/
 *.egg-info/
 tests/
+data/
+lab/
+deploy/
+scripts/
+docs/
+*.pptx
