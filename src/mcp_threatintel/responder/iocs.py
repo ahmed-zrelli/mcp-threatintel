@@ -184,6 +184,53 @@ class IocIndex:
         kind = "ip" if _is_ip(value) else ("hash" if len(value) in (32, 40, 64) else "domain")
         return any(m.get("source") == "local" for m in self.lookup(kind, value))
 
+    def related(self, indicator: str, limit: int = 300) -> dict:
+        """Campaign pivot: OTX pulses and malware families that contain ``indicator``,
+        and the other indicators they list (normalised types, shared services removed)."""
+        out = {"pulses": [], "families": [], "related": []}
+        if not self.available or not indicator:
+            return out
+        value = indicator.strip()
+        conn = self._connect()
+        try:
+            pulses = conn.execute(
+                "SELECT DISTINCT p.pulse_id, p.name, p.adversary, p.malware_families FROM pulse_indicators pi "
+                "JOIN pulses p ON p.pulse_id = pi.pulse_id WHERE lower(pi.indicator) = lower(?) LIMIT 10",
+                (value,),
+            ).fetchall()
+            out["pulses"] = [{"id": r["pulse_id"], "name": (r["name"] or "")[:100], "adversary": r["adversary"]}
+                             for r in pulses]
+            fams = [r["malware_family"] for r in conn.execute(
+                "SELECT DISTINCT malware_family FROM iocs WHERE lower(indicator) = lower(?) "
+                "AND malware_family IS NOT NULL AND malware_family != ''", (value,))]
+            out["families"] = fams
+            seen: set[tuple[str, str]] = set()
+
+            def keep(v: str, t: str, src: str) -> None:
+                kind = _TYPE.get((t or "").lower())
+                if not kind or kind == "url" or not v or v.lower() == value.lower():
+                    return
+                v = v.strip().lower() if kind in ("domain", "hash") else v.strip()
+                if (kind == "ip" and is_benign_ip(v)) or (kind == "domain" and is_benign_domain(v)):
+                    return
+                if (v, kind) not in seen and len(seen) < limit:
+                    seen.add((v, kind))
+                    out["related"].append({"value": v, "type": kind, "via": src})
+
+            for p in out["pulses"]:
+                for r in conn.execute("SELECT indicator, type FROM pulse_indicators WHERE pulse_id = ?", (p["id"],)):
+                    keep(r["indicator"], r["type"], f"OTX pulse: {p['name'][:50]}")
+            for fam in fams[:3]:
+                for r in conn.execute(
+                    "SELECT indicator, type, source FROM iocs WHERE malware_family = ? LIMIT ?", (fam, limit)
+                ):
+                    keep(r["indicator"], r["type"], f"{r['source']} family: {fam}")
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            conn.close()
+        return out
+
     def feed_ips(self, source: str, limit: int = 5000) -> list[str]:
         """IP indicators of one feed (for block_feed_c2)."""
         if not self.available:

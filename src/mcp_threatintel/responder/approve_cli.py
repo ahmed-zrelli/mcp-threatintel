@@ -79,6 +79,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--reason", default="")
     p = sub.add_parser("alerts", help="show alerts from the always-on detection")
     p.add_argument("--limit", type=int, default=20)
+    sub.add_parser("alert", help="one alert in full: evidence and investigation report").add_argument("id", type=int)
     p = sub.add_parser("audit", help="show the audit log")
     p.add_argument("--id", type=int)
     p.add_argument("--limit", type=int, default=30)
@@ -119,6 +120,16 @@ def main(argv: list[str] | None = None) -> None:
             print(f"#{a['id']:<4} {a['ts']}  {a['severity'].upper():<8} {a['title']}")
             for x in a.get("actions", []):
                 print(f"        action {x['id']}: {x['type']} {x['target'][:40]} -> {x['status']}")
+    elif args.cmd == "alert":
+        a = _call(config, "list_alerts", alert_id=args.id)
+        print(f"#{a['id']}  {a['ts']}  {a['severity'].upper()}  {a['title']}")
+        for x in a.get("actions", []):
+            print(f"  action {x['id']}: {x['type']} {x['target'][:50]} -> {x['status']}")
+        for name, data in (a["detail"].get("evidence") or {}).items():
+            print(f"  evidence [{name}]: {json.dumps(data, default=str)[:400]}")
+        print(f"\n  REPORT ({a.get('report_by') or '-'}, {a.get('report_at') or 'not written yet'}):")
+        for line in (a.get("report") or "(none yet: the PC notifier writes it)").splitlines():
+            print(f"    {line}")
     elif args.cmd == "audit":
         for e in _call(config, "audit", id=args.id, limit=args.limit):
             print(f"{e['ts']}  #{e['action_id'] or '-':<5} {e['actor']:<22} {e['event']:<20} "

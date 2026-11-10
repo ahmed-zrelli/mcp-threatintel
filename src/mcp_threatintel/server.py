@@ -403,14 +403,52 @@ async def scan_host(minutes: int = 60) -> str:
 
 
 @mcp.tool(annotations=HOST_READ)
-async def list_alerts(since_id: int = 0, limit: int = 10) -> str:
-    """Alerts raised by the server's always-on detection, with their pending actions.
+async def list_alerts(since_id: int = 0, limit: int = 10, alert_id: int = 0) -> str:
+    """Alerts from the server's always-on detection, with their pending actions.
 
     Args:
         since_id: Only alerts newer than this id (0 = the latest ones).
         limit: Maximum number of alerts (default 10).
+        alert_id: Return this one alert in full: evidence collected at alert time and report.
     """
+    if alert_id:
+        return await _agent_call("list_alerts", alert_id=alert_id)
     return await _agent_call("list_alerts", since_id=since_id, limit=limit)
+
+
+@mcp.tool(annotations=HOST_READ)
+async def investigate_host(kind: str, value: str) -> str:
+    """Read-only investigation on the server. kind: process (value=PID: parent chain, executable hash,
+    user, connections, files), file (value=path: hashes, type, owner, times, users), ip (connections,
+    DNS, SSH, actions) or domain (lookups, answers, processes, sinkhole).
+
+    Args:
+        kind: process, file, ip or domain.
+        value: PID, absolute path, IP or domain.
+    """
+    return await _agent_call("investigate_host", kind=kind, value=value)
+
+
+@mcp.tool(annotations=HOST_READ)
+async def related_iocs(indicator: str) -> str:
+    """Campaign pivot: OTX pulses / malware family of an indicator, their other IOCs,
+    and which of those are ALSO present on the server.
+
+    Args:
+        indicator: IP, domain or hash.
+    """
+    return await _agent_call("related_iocs", indicator=indicator)
+
+
+@mcp.tool(annotations=GOVERN)
+async def save_alert_report(alert_id: int, report: str) -> str:
+    """Store the investigation report of an alert on the server (text only, changes nothing on the host).
+
+    Args:
+        alert_id: The alert investigated.
+        report: The structured report.
+    """
+    return await _agent_call("save_alert_report", alert_id=alert_id, report=report, by="qwen")
 
 
 # ============================================================

@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 
 from .actions import ActionManager
 from .findings import Finding, extract_findings
+from .forensics import Forensics, collect_evidence
 from .scanner import HostScanner
 from .store import ResponderDB
 from .validators import ValidationError
@@ -40,6 +41,8 @@ class AlertEngine:
         self.interval_s = interval_s
         self.window_min = window_min
         self.realert_hours = realert_hours
+        # Evidence needs the real scanner (IOC index + collectors); test doubles skip it.
+        self.forensics = Forensics(scanner, db) if hasattr(scanner, "iocs") else None
         self.last_run: str | None = None
         self.last_error: str | None = None
 
@@ -61,6 +64,8 @@ class AlertEngine:
             | ({"error": (a.get("result") or {}).get("error") or a.get("error")} if a.get("status") == "rejected" else {})
             for a in actions
         ]}
+        if self.forensics:
+            detail["evidence"] = collect_evidence(self.forensics, finding.kind, finding.detail)
         alert_id = self.db.insert_alert(key=finding.key, kind=finding.kind, severity=finding.severity,
                                         title=finding.title, detail=detail, action_ids=ids)
         self.db.append_audit("auto-detect", "alert", None, alert_id=alert_id, severity=finding.severity,

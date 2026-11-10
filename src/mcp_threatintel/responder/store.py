@@ -90,7 +90,16 @@ class ResponderDB:
             self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._lock = threading.Lock()
+
+    def _migrate(self) -> None:
+        """Columns added after the first release (existing databases on deployed servers)."""
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(alerts)")}
+        for col, ddl in (("report", "TEXT"), ("report_by", "TEXT"), ("report_at", "TEXT")):
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE alerts ADD COLUMN {col} {ddl}")
+        self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
@@ -191,6 +200,22 @@ class ResponderDB:
             )
             self._conn.commit()
             return cur.lastrowid
+
+    def get_alert(self, alert_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["detail"] = json.loads(d.pop("detail_json") or "{}")
+        d["action_ids"] = json.loads(d["action_ids"] or "[]")
+        return d
+
+    def save_report(self, alert_id: int, report: str, by: str) -> None:
+        with self._lock:
+            self._conn.execute("UPDATE alerts SET report = ?, report_by = ?, report_at = ? WHERE id = ?",
+                               (report[:8000], by, now_iso(), alert_id))
+            self._conn.commit()
 
     def alerted_since(self, key: str, since_iso: str) -> bool:
         with self._lock:

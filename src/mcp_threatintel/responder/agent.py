@@ -38,6 +38,7 @@ logger = logging.getLogger("threatintel.responder")
 
 AGENT_OPS = {
     "ping", "scan_connections", "scan_files", "scan_auth_logs", "scan_host", "scan_dns", "scan_processes", "list_alerts",
+    "investigate_host", "related_iocs", "save_alert_report",
     "create_action", "get_action", "list_actions", "request_rollback",
 }
 ADMIN_OPS = {"ping", "list_actions", "get_action", "approve", "reject", "audit", "list_alerts"}
@@ -133,11 +134,38 @@ class HostAgent:
         if op == "scan_processes":
             return await asyncio.to_thread(self.scanner.scan_processes)
         if op == "list_alerts":
+            if p.get("alert_id"):  # one alert in full: evidence and report included
+                alert = self.db.get_alert(int(p["alert_id"]))
+                if not alert:
+                    raise TransitionError(f"no alert with id {p['alert_id']}")
+                alert["actions"] = [summarize(x) for x in (self.db.get_action(i) for i in alert["action_ids"]) if x]
+                alert["detail"].pop("actions", None)
+                return alert
             alerts = self.db.list_alerts(int(p.get("since_id") or 0), max(1, min(int(p.get("limit", 20)), 200)))
-            for a in alerts:  # current status of the actions created for each alert
+            for a in alerts:  # current status of the actions; evidence only via alert_id (keeps lists small)
                 a["actions"] = [summarize(x) for x in (self.db.get_action(i) for i in a["action_ids"]) if x]
                 a["detail"].pop("actions", None)
+                a["has_evidence"] = bool(a["detail"].pop("evidence", None))
+                a["report_summary"] = (a.get("report") or "").split("\n")[0][:200] or None
+                a.pop("report", None)
             return alerts
+        if op == "investigate_host":
+            kind, value = str(p.get("kind") or ""), p.get("value")
+            fx = self.detector.forensics
+            fn = {"process": fx.inspect_process, "file": fx.inspect_file,
+                  "ip": fx.ip_activity, "domain": fx.domain_activity}.get(kind)
+            if not fn:
+                raise ValidationError("kind must be process, file, ip or domain")
+            return await asyncio.to_thread(fn, value)
+        if op == "related_iocs":
+            return await asyncio.to_thread(self.detector.forensics.related_iocs, str(p.get("indicator") or ""))
+        if op == "save_alert_report":
+            alert_id, report = int(p.get("alert_id") or 0), str(p.get("report") or "").strip()
+            if not self.db.get_alert(alert_id) or not report:
+                raise ValidationError("unknown alert or empty report")
+            self.db.save_report(alert_id, report, str(p.get("by") or "model")[:40])
+            self.db.append_audit("mcp-server", "alert_report", None, alert_id=alert_id)
+            return {"alert_id": alert_id, "saved": True}
         if op == "scan_files":
             return await asyncio.to_thread(self.scanner.scan_files, str(p.get("path") or ""))
         if op == "scan_auth_logs":

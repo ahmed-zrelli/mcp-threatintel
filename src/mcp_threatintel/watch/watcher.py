@@ -107,23 +107,73 @@ async def show(mcp, alert: dict, args, toast: bool) -> None:
     for a in actions:
         out(f"    - {describe(a)}")
     out(f"    {approve_hint(actions)}")
+    full = _text(await mcp.call_tool("list_alerts", {"alert_id": alert["id"]}))
+    if not isinstance(full, dict) or full.get("error"):
+        full = alert
+    if full.get("report"):
+        return  # already investigated (e.g. by another notifier)
     if args.no_ai or not await llm_available(args.llm_url):
-        return
-    brief = {"alert": {k: alert.get(k) for k in ("kind", "severity", "title", "detail")},
-             "actions_already_created": [{k: a.get(k) for k in ("id", "type", "target", "status")} for a in actions]}
-    out(f"    AI investigating alert #{alert['id']} (Qwen)...")
+        report, by = basic_report(full, actions), "auto"
+    else:
+        brief = {"alert": {k: full.get(k) for k in ("id", "ts", "kind", "severity", "title")},
+                 "detail": {k: v for k, v in (full.get("detail") or {}).items() if k != "evidence"},
+                 "actions_already_created": [{k: a.get(k) for k in ("id", "type", "target", "status")}
+                                             for a in actions],
+                 "evidence": (full.get("detail") or {}).get("evidence")}
+        text = json.dumps(brief, default=str)
+        if len(text) > 7000:  # keep room in an 8k-token context
+            text = text[:7000] + " ...(truncated)"
+        out(f"    AI investigating alert #{alert['id']} (Qwen)...")
+        try:
+            report, more = await investigate(mcp, args.llm_url, text, timeout=args.llm_timeout)
+            by = "qwen"
+        except Exception as e:
+            out(f"    AI unavailable ({e}); saving a basic report")
+            report, more, by = basic_report(full, actions), [], "auto"
+        new = [a for a in more if a.get("id") not in {x.get("id") for x in actions}]
+        for a in new:
+            out(f"    + AI added {describe(a)}")
+        actions = actions + new
     try:
-        analysis, more = await investigate(mcp, args.llm_url, json.dumps(brief, default=str), timeout=args.llm_timeout)
+        await mcp.call_tool("save_alert_report", {"alert_id": alert["id"], "report": report})
     except Exception as e:
-        out(f"    AI unavailable ({e})")
-        return
-    out("    AI analysis: " + analysis.replace("\n", " "))
-    new = [a for a in more if a.get("id") not in {x.get("id") for x in actions}]
-    for a in new:
-        out(f"    + AI added {describe(a)}")
+        out(f"    could not save the report on the server ({e})")
+    out(f"    REPORT ({by}):\n      " + report.replace("\n", "\n      "))
     if toast:
-        notify(f"ThreatIntel - AI analysis of alert #{alert['id']}",
-               [analysis[:200], approve_hint(actions + new) if new else ""])
+        summary = next((line.split(":", 1)[1].strip() for line in report.splitlines()
+                        if line.upper().startswith("SUMMARY")), report[:180])
+        notify(f"ThreatIntel - report for alert #{alert['id']}", [summary[:200], approve_hint(actions)])
+
+
+def basic_report(alert: dict, actions: list[dict]) -> str:
+    """Report built from the evidence alone, when the model is not running."""
+    detail = alert.get("detail") or {}
+    ev = detail.get("evidence") or {}
+    proc = ev.get("process") or {}
+    camp = ev.get("campaign") or {}
+    scope = []
+    if proc.get("pid"):
+        parents = " <- ".join(f"{p['name']}({p['pid']})" for p in proc.get("parent_chain", [])[:3])
+        scope.append(f"process {proc.get('name')} PID {proc.get('pid')} user {proc.get('user')}"
+                     + (f", started {proc.get('started')}" if proc.get("started") else "")
+                     + (f", parents: {parents}" if parents else ""))
+    if (ev.get("file") or {}).get("path"):
+        f = ev["file"]
+        scope.append(f"file {f['path']} ({f.get('type')}, owner {f.get('owner')}, modified {f.get('modified')})")
+    present = camp.get("related_present_on_host") or []
+    if present:
+        scope.append("related IOCs also present: " + ", ".join(r["value"] for r in present[:5]))
+    threat = ", ".join([p["name"] for p in camp.get("pulses", [])[:2]] + camp.get("malware_families", [])[:2])
+    lines = [
+        f"SUMMARY: {alert.get('title')}",
+        f"SEVERITY: {alert.get('severity')} - rule-based (model not running)",
+        f"WHAT HAPPENED: detected at {alert.get('ts')}; indicator listed by {detail.get('ioc') or 'threat feeds'}.",
+        "SCOPE: " + ("; ".join(scope) or "see evidence on the server: threatintel-approve alert " + str(alert.get("id"))),
+        "THREAT: " + (threat or detail.get("ioc") or "unknown"),
+        "RECOMMENDED ACTIONS: " + approve_hint(actions),
+        "CONFIDENCE: medium (automatic report)",
+    ]
+    return "\n".join(lines)
 
 
 async def poll(mcp, last: LastSeen, args) -> None:
