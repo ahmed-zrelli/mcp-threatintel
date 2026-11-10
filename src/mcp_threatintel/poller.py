@@ -16,6 +16,7 @@ import csv
 import logging
 import os
 import time
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 
@@ -145,9 +146,17 @@ async def poll_otx(conn):
     try:
         client = OtxClient(api_key)
 
-        # Get last sync time for delta
-        row = conn.execute("SELECT last_sync FROM feed_sync WHERE source = 'otx'").fetchone()
-        modified_since = row["last_sync"] if row else ""
+        # Delta sync only after a successful sync that actually stored pulses.
+        # Otherwise (first run, or the previous run failed, e.g. no key yet)
+        # backfill the last OTX_BACKFILL_DAYS days instead of asking for
+        # "changes since a failed attempt", which returns almost nothing.
+        row = conn.execute("SELECT last_sync, status FROM feed_sync WHERE source = 'otx'").fetchone()
+        stored = conn.execute("SELECT COUNT(*) FROM pulses").fetchone()[0]
+        if row and row["status"] == "ok" and stored:
+            modified_since = row["last_sync"]
+        else:
+            days = int(os.getenv("OTX_BACKFILL_DAYS", "30"))
+            modified_since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
         pulses = await client.get_subscribed_pulses(modified_since=modified_since)
         added = 0
@@ -160,8 +169,9 @@ async def poll_otx(conn):
                 upsert_pulse_indicator(conn, pulse_id, indicator, ioc_type)
             added += 1
         conn.commit()
-        update_feed_sync(conn, "otx", added)
-        logger.info("otx: upserted %d pulses", added)
+        indicators = conn.execute("SELECT COUNT(*) FROM pulse_indicators").fetchone()[0]
+        update_feed_sync(conn, "otx", added, total=indicators)
+        logger.info("otx: upserted %d pulses (%d indicators stored)", added, indicators)
         await client.close()
     except Exception as e:
         logger.error("otx poll failed: %s", e)

@@ -21,19 +21,24 @@ class OtxClient(BaseClient):
             rate_limit=0.5,
         )
 
-    async def get_subscribed_pulses(self, modified_since: str = "", limit: int = 50) -> list[dict]:
-        """Get pulses from subscribed feeds.
+    async def get_subscribed_pulses(self, modified_since: str = "", limit: int = 50, max_pages: int = 4) -> list[dict]:
+        """Get pulses from subscribed feeds, newest first, up to ``max_pages`` pages.
 
         Args:
             modified_since: ISO timestamp to get only pulses modified after this time.
             limit: Max pulses per page.
+            max_pages: Page cap, so a first sync of a busy account stays small.
         """
-        params = {"limit": limit}
-        if modified_since:
-            params["modified_since"] = modified_since
-
-        data = await self.get("/api/v1/pulses/subscribed", params=params)
-        pulses = data.get("results", [])
+        pulses: list[dict] = []
+        for page in range(1, max_pages + 1):
+            params = {"limit": limit, "page": page}
+            if modified_since:
+                params["modified_since"] = modified_since
+            data = await self.get("/api/v1/pulses/subscribed", params=params)
+            batch = data.get("results", []) or []
+            pulses.extend(batch)
+            if len(batch) < limit or not data.get("next"):
+                break
         logger.info("otx: fetched %d subscribed pulses", len(pulses))
         return pulses
 

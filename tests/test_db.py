@@ -61,3 +61,37 @@ def test_connect_applies_wal_each_time(tmp_path):
     db.init_db(path).close()
     with db.connect(path) as conn:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+
+
+def test_otx_backfills_after_a_failed_sync(tmp_path, monkeypatch):
+    """A previous 'error' row (no key yet) must not turn the first real sync into a near-empty delta."""
+    import asyncio
+    from datetime import datetime, timezone
+
+    from mcp_threatintel import db as dbmod, poller
+
+    conn = dbmod.init_db(str(tmp_path / "t.db"))
+    dbmod.update_feed_sync(conn, "otx", 0, status="error", error="OTX_API_KEY not set")
+    asked = {}
+
+    class FakeOtx:
+        def __init__(self, key):
+            pass
+
+        async def get_subscribed_pulses(self, modified_since=""):
+            asked["since"] = modified_since
+            return [{"id": "p1", "name": "pulse", "indicators": [{"indicator": "6.6.6.6", "type": "IPv4"}]}]
+
+        shape_pulse = poller.OtxClient.shape_pulse
+        shape_indicators = poller.OtxClient.shape_indicators
+
+        async def close(self):
+            pass
+
+    monkeypatch.setenv("OTX_API_KEY", "k")
+    monkeypatch.setattr(poller, "OtxClient", FakeOtx)
+    asyncio.run(poller.poll_otx(conn))
+    age = datetime.now(timezone.utc) - datetime.fromisoformat(asked["since"])
+    assert age.days >= 29  # backfill window, not "since the failed attempt"
+    row = conn.execute("SELECT status, records_total FROM feed_sync WHERE source='otx'").fetchone()
+    assert row["status"] == "ok" and row["records_total"] == 1

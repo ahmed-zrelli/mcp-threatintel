@@ -215,9 +215,11 @@ def upsert_vulnerability(conn: sqlite3.Connection, vuln: dict) -> None:
     )
 
 
-def update_feed_sync(conn: sqlite3.Connection, source: str, records_added: int, status: str = "ok", error: str = None) -> None:
-    """Update the sync status for a feed source."""
-    total = conn.execute("SELECT COUNT(*) FROM iocs WHERE source = ?", (source,)).fetchone()[0]
+def update_feed_sync(conn: sqlite3.Connection, source: str, records_added: int, status: str = "ok",
+                     error: str = None, total: int | None = None) -> None:
+    """Update the sync status for a feed source (total defaults to its IOC count)."""
+    if total is None:
+        total = conn.execute("SELECT COUNT(*) FROM iocs WHERE source = ?", (source,)).fetchone()[0]
     conn.execute(
         """INSERT INTO feed_sync (source, last_sync, records_added, records_total, status, error_message)
            VALUES (?, ?, ?, ?, ?, ?)
