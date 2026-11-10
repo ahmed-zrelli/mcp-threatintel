@@ -49,6 +49,7 @@ mcp-threatintel = "mcp_threatintel.server:main"
 mcp-threatintel-poller = "mcp_threatintel.poller:main"
 threatintel-responder = "mcp_threatintel.responder.agent:main"
 threatintel-approve = "mcp_threatintel.responder.approve_cli:main"
+threatintel-watch = "mcp_threatintel.watch.watcher:main"
 
 [project.urls]
 Homepage = "https://github.com/pete-builds/mcp-threatintel"

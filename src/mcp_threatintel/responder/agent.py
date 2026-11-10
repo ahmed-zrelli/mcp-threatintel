@@ -131,7 +131,10 @@ class HostAgent:
                 self.manager.create, str(p.get("type")), dict(p.get("params") or {}),
                 str(p.get("reason") or ""), "mcp-server",
             )
-            return summarize(action)
+            out = summarize(action)
+            if action.get("duplicate"):
+                out["duplicate"] = True
+            return out
         if op == "get_action":
             action = self.db.get_action(int(p.get("id", 0)))
             if not action:

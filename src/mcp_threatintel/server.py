@@ -183,7 +183,11 @@ async def _agent_call(op: str, **params) -> str:
 
 
 def _pending_note(action: dict) -> dict:
-    if action.get("status") == "pending":
+    if action.get("duplicate"):
+        action["next_step"] = (
+            f"An identical action already exists (#{action['id']}, {action['status']}); no new action was created."
+        )
+    elif action.get("status") == "pending":
         action["next_step"] = (
             f"Awaiting human approval. The analyst must run: threatintel-approve approve {action['id']}"
         )

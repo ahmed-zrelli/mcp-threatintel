@@ -116,6 +116,11 @@ class ActionManager:
         try:
             target, clean = self.validate(type_, params)
             status, result = "pending", None
+            existing = self._find_active(type_, target)
+            if existing:
+                # Same request again (watcher + model, or a repeated alert): reuse it.
+                self.db.append_audit(requested_by, "duplicate_request", existing["id"], type=type_, target=target)
+                return {**existing, "duplicate": True}
         except ValidationError as e:
             target = str(params.get("ip") or params.get("domain") or params.get("path")
                          or params.get("pid") or params.get("feed") or "?")
@@ -127,6 +132,14 @@ class ActionManager:
         self.db.append_audit(requested_by, "created" if status == "pending" else "refused_at_creation",
                              action_id, type=type_, target=target, **(result or {}))
         return self.db.get_action(action_id)
+
+    def _find_active(self, type_: str, target: str) -> dict | None:
+        """A pending, approved or still-executed action of the same type on the same target."""
+        for status in ("pending", "approved", "executed"):
+            for a in self.db.list_actions(status, limit=500):
+                if a["type"] == type_ and a["target"] == target and a["dry_run"] == self.config.dry_run:
+                    return a
+        return None
 
     def request_rollback(self, action_id: int, reason: str, requested_by: str) -> dict:
         original = self._get(action_id)

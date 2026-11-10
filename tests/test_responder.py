@@ -527,3 +527,13 @@ def test_nft_ruleset_template_is_valid_shape():
     assert "@MCP_CLIENTS@" in text and "table inet threatintel {" in text
     assert "set blocklist" in text and "flags timeout" in text
     assert "tcp dport 3707 ip saddr != @mcp_clients" in text
+
+
+def test_duplicate_request_reuses_the_pending_action(agent):
+    a1 = call(agent, "agent", "create_action", type="block_ip", params={"ip": "45.1.2.3"}, reason="watch")["data"]
+    a2 = call(agent, "agent", "create_action", type="block_ip", params={"ip": "45.1.2.3"}, reason="model")["data"]
+    assert a2["id"] == a1["id"] and a2["duplicate"] is True
+    assert len(agent.db.list_actions("pending")) == 1
+    call(agent, "admin", "reject", id=a1["id"], actor="alice")
+    a3 = call(agent, "agent", "create_action", type="block_ip", params={"ip": "45.1.2.3"}, reason="again")["data"]
+    assert a3["id"] != a1["id"] and not a3.get("duplicate")  # a rejected action does not block a new request
