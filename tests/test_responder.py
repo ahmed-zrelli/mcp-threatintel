@@ -398,7 +398,7 @@ def test_parse_auth_lines_linux_and_windows_formats():
     assert out["192.168.56.66"]["failures"] == 3
     assert out["192.168.56.66"]["users"] == {"root", "admin", "oracle"}
     assert out["10.0.0.5"]["failures"] == 1
-    assert "10.0.0.9" not in out
+    assert out["10.0.0.9"]["failures"] == 0 and out["10.0.0.9"]["accepted"] == 1  # successful logins are tracked
 
 
 def test_scan_files_finds_local_ioc_hash(config, ioc_db):

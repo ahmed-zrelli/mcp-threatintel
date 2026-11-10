@@ -71,14 +71,15 @@ async def create_planned(mcp, findings: list[Finding]) -> list[dict]:
 
 async def handle(mcp, findings: list[Finding], args) -> None:
     actions = await create_planned(mcp, findings)
+    top = findings[0].severity.upper()  # findings are sorted, most severe first
     title = findings[0].title if len(findings) == 1 else f"{len(findings)} new threats on the server"
     lines = [f.title for f in findings][:2] if len(findings) > 1 else [findings[0].detail.get("ioc") or ""]
     lines.append(approve_hint(actions))
-    shown = notify("ThreatIntel ALERT - " + title, lines)
+    shown = notify(f"ThreatIntel {top} - " + title, lines)
 
-    print(f"\n[{_ts()}] ===== ALERT =====" + ("" if shown else " (notification not shown)"))
+    print(f"\n[{_ts()}] ===== ALERT ({top}) =====" + ("" if shown else " (notification not shown)"))
     for f in findings:
-        print(f"  ! {f.title}")
+        print(f"  ! [{f.severity}] {f.title}")
     for a in actions:
         print(f"    - {describe(a)}")
     print(f"  {approve_hint(actions)}")
@@ -86,7 +87,8 @@ async def handle(mcp, findings: list[Finding], args) -> None:
     if args.no_ai:
         return
     brief = {
-        "new_findings": [{"kind": f.kind, "title": f.title, "detail": f.detail} for f in findings],
+        "new_findings": [{"kind": f.kind, "severity": f.severity, "title": f.title, "detail": f.detail}
+                         for f in findings],
         "actions_already_created": [
             {k: a.get(k) for k in ("id", "type", "target", "status", "error")} for a in actions
         ],

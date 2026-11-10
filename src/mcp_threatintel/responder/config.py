@@ -17,6 +17,7 @@ if IS_WINDOWS:
     _AGENT_ADDR = "tcp://127.0.0.1:3710"
     _ADMIN_ADDR = "tcp://127.0.0.1:3711"
     _ADMIN_TOKEN = None  # derived from data_dir (RESPONDER_DATA_DIR)
+    _EXTRA_SCAN_PATHS = ""
 else:
     # Linux layout (scripts/ubuntu/setup-ubuntu.sh). The two sockets live in
     # separate directories so the MCP container can be given the agent one
@@ -26,6 +27,7 @@ else:
     _AGENT_ADDR = "unix:///run/threatintel/agent.sock"
     _ADMIN_ADDR = "unix:///run/threatintel-admin/admin.sock"
     _ADMIN_TOKEN = Path("/etc/threatintel/admin.token")
+    _EXTRA_SCAN_PATHS = "/tmp:/var/tmp:/dev/shm"
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -35,8 +37,8 @@ def _bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _paths(name: str) -> list[Path]:
-    raw = os.getenv(name, "")
+def _paths(name: str, default: str = "") -> list[Path]:
+    raw = os.getenv(name, default)
     # os.pathsep is ";" on Windows (paths contain ":") and ":" on Linux.
     return [Path(p.strip()).expanduser() for p in raw.split(os.pathsep) if p.strip()]
 
@@ -84,7 +86,8 @@ class ResponderConfig:
             quarantine_dir=Path(os.getenv("QUARANTINE_DIR", str(data_dir / "quarantine"))),
             hosts_path=Path(os.getenv("HOSTS_PATH", str(_HOSTS))),
             allowlist_file=Path(allowlist) if allowlist else None,
-            scan_paths=_paths("SCAN_PATHS"),
+            # SCAN_PATHS (lab folder...) plus the usual malware drop locations.
+            scan_paths=list(dict.fromkeys(_paths("SCAN_PATHS") + _paths("EXTRA_SCAN_PATHS", _EXTRA_SCAN_PATHS))),
             dry_run=_bool("RESPONDER_DRY_RUN", True),
             block_ttl=float(os.getenv("BLOCK_DEFAULT_TTL", os.getenv("BLOCK_DEFAULT_TTL_HOURS", "24"))),
             ttl_unit=os.getenv("BLOCK_TTL_UNIT", "hours").strip().lower(),

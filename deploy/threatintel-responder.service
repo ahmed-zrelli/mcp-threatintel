@@ -20,7 +20,7 @@ RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=yes
 
 UMask=0027
-PrivateTmp=yes
+# No PrivateTmp: the agent must see (and quarantine from) the real /tmp, /var/tmp, /dev/shm.
 NoNewPrivileges=yes
 
 [Install]

@@ -368,23 +368,23 @@ async def get_latest_breach() -> str:
 
 @mcp.tool(annotations=HOST_READ)
 async def scan_network_connections() -> str:
-    """List active network connections whose remote IP is a known IOC (with PID and process)."""
-    return await _agent_call("scan_connections")
+    """Network connections (live + sampled in the last 10 min) whose remote IP is in any threat feed, with PID/process."""
+    return await _agent_call("scan_connections", minutes=10)
 
 
 @mcp.tool(annotations=HOST_READ)
 async def scan_files(path: str = "") -> str:
-    """Hash files (SHA-256) in an authorised directory and report known-malicious ones.
+    """Hash files (MD5/SHA-1/SHA-256) and report those found in any malware feed.
 
     Args:
-        path: Directory or file inside SCAN_PATHS. Empty = all of SCAN_PATHS.
+        path: Directory or file inside SCAN_PATHS. Empty = lab folder + /tmp, /var/tmp, /dev/shm.
     """
     return await _agent_call("scan_files", path=path)
 
 
 @mcp.tool(annotations=HOST_READ)
 async def check_auth_logs(minutes: int = 60) -> str:
-    """Detect SSH brute force: failed logins per source IP over the last N minutes.
+    """SSH logins per source IP: brute force, and failed OR successful logins from known-malicious IPs.
 
     Args:
         minutes: Time window (default 60).
@@ -394,7 +394,7 @@ async def check_auth_logs(minutes: int = 60) -> str:
 
 @mcp.tool(annotations=HOST_READ)
 async def scan_host(minutes: int = 60) -> str:
-    """Run all host scans (connections, files, auth logs) and suggest actions.
+    """Full scan against every feed indicator: connections, DNS lookups, files, process command lines, SSH logins.
 
     Args:
         minutes: Auth log window (default 60).

@@ -1,30 +1,40 @@
-"""HostScanner: read-only inspection of the host, cross-checked with the IOC cache.
+"""HostScanner: read-only inspection of the host, cross-checked with every
+indicator the poller collected (IocIndex: IPs, domains, URLs, MD5/SHA-1/SHA-256,
+from abuse.ch, OTX and the lab list).
 
-Nothing here modifies the machine. Results are capped (config.max_results) so
-a scan never floods the model's context window.
+Detectors:
+  connections  - live + recently sampled remote endpoints   vs IPs
+  dns          - names the server resolved (systemd-resolved) vs domains
+  files        - SCAN_PATHS + temp dirs, all three hashes   vs hashes
+  processes    - URLs / domains / IPs in command lines      vs URLs, domains, IPs
+  auth_logs    - SSH failures (brute force) and logins (even successful) from malicious IPs
+
+Nothing here modifies the machine. Results are capped (config.max_results).
 """
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import logging
 import os
 import re
 import subprocess
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
 import psutil
 
-from .backends.quarantine import sha256_file
 from .config import ResponderConfig
 from .iocs import IocIndex
+from .monitor import ConnectionSampler, DnsMonitor
 from .validators import ValidationError, validate_path
 
 logger = logging.getLogger("threatintel.responder.scanner")
 
-MAX_FILES = 500
+MAX_FILES = 2000
 MAX_FILE_BYTES = 100 * 1024 * 1024
 
 # OpenSSH writes the same messages on Linux (auth.log/journald) and Windows
@@ -33,13 +43,23 @@ _FAILED = re.compile(
     r"(?:Failed (?:password|publickey|keyboard-interactive/pam) for (?:invalid user )?(?P<user>\S+)"
     r"|Invalid user (?P<user2>\S+)) from (?P<ip>[0-9a-fA-F:.]+)"
 )
+_ACCEPTED = re.compile(r"Accepted \S+ for (?P<user>\S+) from (?P<ip>[0-9a-fA-F:.]+)")
+
+_URL = re.compile(r"\b(?:https?|ftp)://[^\s'\"<>|;`]+", re.I)
+_IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_DOMAIN = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{1,62}\b", re.I)
+_NOT_DOMAIN_SUFFIX = {"py", "sh", "so", "conf", "json", "txt", "log", "service", "socket", "db", "csv", "pid", "lock"}
 
 
 def parse_auth_lines(lines) -> dict[str, dict]:
-    """Count failed SSH authentications per source IP."""
-    per_ip: dict[str, dict] = defaultdict(lambda: {"failures": 0, "users": set()})
+    """Count failed and successful SSH authentications per source IP."""
+    per_ip: dict[str, dict] = defaultdict(lambda: {"failures": 0, "accepted": 0, "users": set()})
     for line in lines:
         m = _FAILED.search(line)
+        kind = "failures"
+        if not m:
+            m = _ACCEPTED.search(line)
+            kind = "accepted"
         if not m:
             continue
         ip = m.group("ip")
@@ -48,87 +68,157 @@ def parse_auth_lines(lines) -> dict[str, dict]:
         except ValueError:
             continue
         entry = per_ip[ip]
-        entry["failures"] += 1
-        entry["users"].add(m.group("user") or m.group("user2"))
+        entry[kind] += 1
+        entry["users"].add(m.groupdict().get("user") or m.groupdict().get("user2"))
     return per_ip
 
 
+def extract_observables(cmdline: str) -> list[tuple[str, str]]:
+    """(kind, value) pairs worth checking in a process command line."""
+    out: list[tuple[str, str]] = []
+    for url in _URL.findall(cmdline):
+        url = url.rstrip(").,")
+        out.append(("url", url))
+    for ip in _IPV4.findall(cmdline):
+        try:
+            ipaddress.IPv4Address(ip)
+            out.append(("ip", ip))
+        except ValueError:
+            pass
+    for d in _DOMAIN.findall(cmdline):
+        d = d.lower()
+        if d.rsplit(".", 1)[-1] not in _NOT_DOMAIN_SUFFIX and not _IPV4.fullmatch(d):
+            out.append(("domain", d))
+    return list(dict.fromkeys(out))
+
+
+def hash_file(path: Path) -> dict[str, str]:
+    md5, sha1, sha256 = hashlib.md5(), hashlib.sha1(), hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            md5.update(block)
+            sha1.update(block)
+            sha256.update(block)
+    return {"md5": md5.hexdigest(), "sha1": sha1.hexdigest(), "sha256": sha256.hexdigest()}
+
+
 class HostScanner:
-    def __init__(self, config: ResponderConfig, iocs: IocIndex):
+    def __init__(self, config: ResponderConfig, iocs: IocIndex,
+                 sampler: ConnectionSampler | None = None, dns: DnsMonitor | None = None):
         self.config = config
         self.iocs = iocs
+        self.sampler = sampler
+        self.dns = dns
+        self._hash_cache: dict[str, tuple[int, float, dict]] = {}
+
+    def _cap(self, hits: list) -> dict:
+        return {"malicious_count": len(hits), "malicious": hits[: self.config.max_results],
+                "truncated": len(hits) > self.config.max_results}
 
     # --- network ------------------------------------------------------------
 
-    def scan_connections(self) -> dict:
-        conns = []
+    def scan_connections(self, window_minutes: int = 10) -> dict:
+        now = time.time()
+        seen: dict[tuple, dict] = {}
         for c in psutil.net_connections(kind="inet"):
-            if not c.raddr:
-                continue
-            conns.append(c)
-        remote_ips = [c.raddr.ip for c in conns]
-        matches = self.iocs.match(remote_ips)
+            if c.raddr:
+                seen[(c.raddr.ip, c.raddr.port, c.pid)] = {
+                    "remote_ip": c.raddr.ip, "remote_port": c.raddr.port,
+                    "local_port": c.laddr.port if c.laddr else None, "status": c.status,
+                    "pid": c.pid, "process": _proc_name(c.pid), "active": True}
+        if self.sampler:
+            for key, r in self.sampler.seen.recent(window_minutes * 60, now):
+                seen.setdefault(key, {**{k: r.get(k) for k in ("remote_ip", "remote_port", "local_port", "status",
+                                                               "pid", "process")},
+                                      "active": False, "last_seen_s_ago": int(now - r["last_seen"])})
         hits = []
-        for c in conns:
-            if c.raddr.ip not in matches:
-                continue
-            hits.append({
-                "remote_ip": c.raddr.ip,
-                "remote_port": c.raddr.port,
-                "local_port": c.laddr.port if c.laddr else None,
-                "status": c.status,
-                "pid": c.pid,
-                "process": _proc_name(c.pid),
-                "ioc_matches": matches[c.raddr.ip],
-            })
-        return {
-            "connections_checked": len(conns),
-            "unique_remote_ips": len(set(remote_ips)),
-            "malicious_count": len(hits),
-            "malicious": hits[: self.config.max_results],
-            "truncated": len(hits) > self.config.max_results,
-            "ioc_cache_available": self.iocs.available,
-        }
+        for rec in seen.values():
+            matches = self.iocs.lookup("ip", rec["remote_ip"])
+            if matches:
+                hits.append({**rec, "ioc_matches": matches})
+        hits.sort(key=lambda h: not h["active"])
+        return {"connections_checked": len(seen), "sampled_history": bool(self.sampler),
+                "ioc_cache_available": self.iocs.available, **self._cap(hits)}
+
+    # --- DNS ----------------------------------------------------------------
+
+    def scan_dns(self, window_minutes: int = 10) -> dict:
+        if not self.dns or not self.dns.available:
+            return {"available": False, "note": "DNS monitoring needs systemd-resolved (Linux)",
+                    "malicious_count": 0, "malicious": []}
+        now = time.time()
+        recent = self.dns.seen.recent(window_minutes * 60, now)
+        hits = []
+        for name, r in recent:
+            matches = self.iocs.lookup_domain(name)
+            if matches:
+                hits.append({"domain": name, "lookups": r["count"], "answers": r.get("answers", []),
+                             "last_seen_s_ago": int(now - r["last_seen"]), "ioc_matches": matches})
+        return {"available": True, "monitor": self.dns.status, "domains_seen": len(recent), **self._cap(hits)}
 
     # --- files --------------------------------------------------------------
 
+    def _roots(self, path: str) -> list[Path]:
+        if path:
+            return [validate_path(path, self.config.scan_paths)]
+        return [p for p in self.config.scan_paths if p.exists()]
+
     def scan_files(self, path: str = "") -> dict:
-        roots = [validate_path(path, self.config.scan_paths)] if path else [
-            p for p in self.config.scan_paths if p.exists()
-        ]
+        roots = self._roots(path)
         if not roots:
             raise ValidationError("no directory to scan: set SCAN_PATHS")
-        hashes: dict[str, list[dict]] = defaultdict(list)
         scanned = skipped = 0
+        hits = []
         for root in roots:
             for file in _walk(root):
                 if scanned >= MAX_FILES:
                     break
                 try:
-                    size = file.stat().st_size
-                    if size > MAX_FILE_BYTES:
+                    st = file.stat()
+                    if st.st_size > MAX_FILE_BYTES:
                         skipped += 1
                         continue
-                    digest = sha256_file(file)
+                    cached = self._hash_cache.get(str(file))
+                    if cached and cached[0] == st.st_size and cached[1] == st.st_mtime:
+                        hashes = cached[2]
+                    else:
+                        hashes = hash_file(file)
+                        self._hash_cache[str(file)] = (st.st_size, st.st_mtime, hashes)
                 except OSError:
                     skipped += 1
                     continue
                 scanned += 1
-                hashes[digest].append({"path": str(file), "size": size})
-        matches = self.iocs.match(list(hashes))
-        hits = [
-            {**f, "sha256": digest, "ioc_matches": matches[digest]}
-            for digest in matches for f in hashes[digest]
-        ]
-        return {
-            "scanned_paths": [str(r) for r in roots],
-            "files_scanned": scanned,
-            "files_skipped": skipped,
-            "limit_reached": scanned >= MAX_FILES,
-            "malicious_count": len(hits),
-            "malicious": hits[: self.config.max_results],
-            "truncated": len(hits) > self.config.max_results,
-        }
+                for algo, digest in hashes.items():
+                    matches = self.iocs.lookup("hash", digest)
+                    if matches:
+                        hits.append({"path": str(file), "size": st.st_size, "sha256": hashes["sha256"],
+                                     "matched_hash": algo, "ioc_matches": matches})
+                        break
+        if len(self._hash_cache) > 20000:
+            self._hash_cache.clear()
+        return {"scanned_paths": [str(r) for r in roots], "files_scanned": scanned, "files_skipped": skipped,
+                "limit_reached": scanned >= MAX_FILES, **self._cap(hits)}
+
+    # --- processes ----------------------------------------------------------
+
+    def scan_processes(self) -> dict:
+        own = {os.getpid()}
+        checked = 0
+        hits = []
+        for p in psutil.process_iter(["pid", "name", "cmdline", "username"]):
+            if p.info["pid"] in own or not p.info.get("cmdline"):
+                continue
+            checked += 1
+            cmd = " ".join(p.info["cmdline"])[:2000]
+            found = []
+            for kind, value in extract_observables(cmd):
+                matches = self.iocs.lookup_domain(value) if kind == "domain" else self.iocs.lookup(kind, value)
+                if matches:
+                    found.append({"type": kind, "value": value, "ioc_matches": matches})
+            if found:
+                hits.append({"pid": p.info["pid"], "process": p.info["name"], "user": p.info.get("username"),
+                             "cmdline": cmd[:300], "indicators": found})
+        return {"processes_checked": checked, **self._cap(hits)}
 
     # --- authentication logs ------------------------------------------------
 
@@ -137,27 +227,24 @@ class HostScanner:
         source, lines, note = _read_auth_logs(minutes)
         per_ip = parse_auth_lines(lines)
         threshold = self.config.auth_fail_threshold
-        ranked = sorted(per_ip.items(), key=lambda kv: kv[1]["failures"], reverse=True)
-        matches = self.iocs.match([ip for ip, _ in ranked])
-        suspects = [
-            {
-                "ip": ip,
-                "failures": d["failures"],
-                "users_tried": sorted(d["users"])[:10],
+        details = []
+        for ip, d in per_ip.items():
+            matches = self.iocs.lookup("ip", ip)
+            details.append({
+                "ip": ip, "failures": d["failures"], "accepted": d["accepted"],
+                "users_tried": sorted(u for u in d["users"] if u)[:10],
                 "brute_force": d["failures"] >= threshold,
-                "ioc_matches": matches.get(ip, []),
-            }
-            for ip, d in ranked
-        ]
+                "known_malicious": bool(matches),
+                "ioc_matches": matches,
+            })
+        details.sort(key=lambda d: (not d["known_malicious"], -d["failures"]))
         return {
-            "log_source": source,
-            "note": note,
-            "minutes": minutes,
-            "threshold": threshold,
-            "lines_read": len(lines),
-            "sources_with_failures": len(suspects),
-            "brute_force_ips": [s["ip"] for s in suspects if s["brute_force"]],
-            "details": suspects[: self.config.max_results],
+            "log_source": source, "note": note, "minutes": minutes, "threshold": threshold,
+            "lines_read": len(lines), "sources_with_failures": sum(1 for d in details if d["failures"]),
+            "brute_force_ips": [d["ip"] for d in details if d["brute_force"]],
+            "malicious_sources": [d["ip"] for d in details if d["known_malicious"]],
+            "successful_logins_from_malicious_ips": [d["ip"] for d in details if d["known_malicious"] and d["accepted"]],
+            "details": details[: self.config.max_results],
         }
 
     # --- aggregate ----------------------------------------------------------
@@ -165,8 +252,10 @@ class HostScanner:
     def scan_host(self, minutes: int = 60) -> dict:
         report: dict = {}
         suggestions: list[str] = []
-        for name, fn in (("connections", self.scan_connections),
+        for name, fn in (("connections", lambda: self.scan_connections(min(minutes, 60))),
+                         ("dns", lambda: self.scan_dns(min(minutes, 60))),
                          ("files", self.scan_files),
+                         ("processes", self.scan_processes),
                          ("auth_logs", lambda: self.scan_auth_logs(minutes))):
             try:
                 report[name] = fn()
@@ -174,14 +263,19 @@ class HostScanner:
                 report[name] = {"error": str(e)}
         for c in report["connections"].get("malicious", []):
             suggestions.append(f"block_ip ip={c['remote_ip']} (connection from {c['process']} PID {c['pid']})")
-            if c.get("pid"):
+            if c.get("pid") and c.get("active"):
                 suggestions.append(f"kill_process pid={c['pid']} ({c['process']})")
+        for d in report["dns"].get("malicious", []):
+            suggestions.append(f"sinkhole_domain domain={d['domain']} (resolved {d['lookups']}x)")
         for f in report["files"].get("malicious", []):
             suggestions.append(f"quarantine_file path={f['path']}")
-        for ip in report["auth_logs"].get("brute_force_ips", []):
-            suggestions.append(f"block_ip ip={ip} (SSH brute force)")
-        report["suggested_actions"] = suggestions[: self.config.max_results]
-        report["findings"] = len(suggestions)
+        for p in report["processes"].get("malicious", []):
+            suggestions.append(f"kill_process pid={p['pid']} ({p['process']}: {p['indicators'][0]['value']})")
+        for ip in report["auth_logs"].get("brute_force_ips", []) + report["auth_logs"].get("malicious_sources", []):
+            suggestions.append(f"block_ip ip={ip} (SSH)")
+        report["suggested_actions"] = list(dict.fromkeys(suggestions))[: self.config.max_results]
+        report["findings"] = len(set(suggestions))
+        report["indicators_indexed"] = self.iocs.counts
         return report
 
 
