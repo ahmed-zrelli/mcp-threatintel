@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 import psutil
@@ -49,11 +50,29 @@ _URL = re.compile(r"\b(?:https?|ftp)://[^\s'\"<>|;`]+", re.I)
 _IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _DOMAIN = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{1,62}\b", re.I)
 _NOT_DOMAIN_SUFFIX = {"py", "sh", "so", "conf", "json", "txt", "log", "service", "socket", "db", "csv", "pid", "lock"}
+#: Name-lookup utilities: they only resolve a name (the DNS detector already reports that), so their
+#: command line is not treated as a malicious process (this also covers the analyst checking a domain).
+_LOOKUP_TOOLS = {"getent", "nslookup", "dig", "host", "drill", "whois", "resolvectl", "threatintel-approve"}
+_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:[.,]\d+)?([+-]\d{2}:?\d{2}|Z)?")
+
+
+def _line_time(line: str) -> float | None:
+    """Epoch of an ISO-timestamped log line (journalctl -o short-iso), else None."""
+    m = _TS.match(line)
+    if not m:
+        return None
+    tz = (m.group(2) or "+00:00").replace("Z", "+00:00")
+    if len(tz) == 5:  # +0000 -> +00:00
+        tz = tz[:3] + ":" + tz[3:]
+    try:
+        return datetime.fromisoformat(m.group(1) + tz).timestamp()
+    except ValueError:
+        return None
 
 
 def parse_auth_lines(lines) -> dict[str, dict]:
-    """Count failed and successful SSH authentications per source IP."""
-    per_ip: dict[str, dict] = defaultdict(lambda: {"failures": 0, "accepted": 0, "users": set()})
+    """Count failed and successful SSH authentications per source IP (with the last event time)."""
+    per_ip: dict[str, dict] = defaultdict(lambda: {"failures": 0, "accepted": 0, "users": set(), "last": None})
     for line in lines:
         m = _FAILED.search(line)
         kind = "failures"
@@ -69,6 +88,9 @@ def parse_auth_lines(lines) -> dict[str, dict]:
             continue
         entry = per_ip[ip]
         entry[kind] += 1
+        t = _line_time(line)
+        if t and (entry["last"] is None or t > entry["last"]):
+            entry["last"] = t
         entry["users"].add(m.groupdict().get("user") or m.groupdict().get("user2"))
     return per_ip
 
@@ -125,12 +147,13 @@ class HostScanner:
                 seen[(c.raddr.ip, c.raddr.port, c.pid)] = {
                     "remote_ip": c.raddr.ip, "remote_port": c.raddr.port,
                     "local_port": c.laddr.port if c.laddr else None, "status": c.status,
-                    "pid": c.pid, "process": _proc_name(c.pid), "active": True}
+                    "pid": c.pid, "process": _proc_name(c.pid), "active": True, "observed_at": now}
         if self.sampler:
             for key, r in self.sampler.seen.recent(window_minutes * 60, now):
                 seen.setdefault(key, {**{k: r.get(k) for k in ("remote_ip", "remote_port", "local_port", "status",
                                                                "pid", "process")},
-                                      "active": False, "last_seen_s_ago": int(now - r["last_seen"])})
+                                      "active": False, "last_seen_s_ago": int(now - r["last_seen"]),
+                                      "observed_at": r["last_seen"]})
         hits = []
         for rec in seen.values():
             matches = self.iocs.lookup("ip", rec["remote_ip"])
@@ -153,7 +176,8 @@ class HostScanner:
             matches = self.iocs.lookup_domain(name)
             if matches:
                 hits.append({"domain": name, "lookups": r["count"], "answers": r.get("answers", []),
-                             "last_seen_s_ago": int(now - r["last_seen"]), "ioc_matches": matches})
+                             "last_seen_s_ago": int(now - r["last_seen"]), "observed_at": r["last_seen"],
+                             "ioc_matches": matches})
         return {"available": True, "monitor": self.dns.status, "domains_seen": len(recent), **self._cap(hits)}
 
     # --- files --------------------------------------------------------------
@@ -192,7 +216,7 @@ class HostScanner:
                     matches = self.iocs.lookup("hash", digest)
                     if matches:
                         hits.append({"path": str(file), "size": st.st_size, "sha256": hashes["sha256"],
-                                     "matched_hash": algo, "ioc_matches": matches})
+                                     "matched_hash": algo, "observed_at": st.st_mtime, "ioc_matches": matches})
                         break
         if len(self._hash_cache) > 20000:
             self._hash_cache.clear()
@@ -218,7 +242,7 @@ class HostScanner:
             matches = self.iocs.lookup("hash", digest)
             if matches:
                 return {"path": str(rp), "size": st.st_size, "sha256": hashes["sha256"],
-                        "matched_hash": algo, "ioc_matches": matches}
+                        "matched_hash": algo, "observed_at": st.st_mtime, "ioc_matches": matches}
         return None
 
     # --- processes ----------------------------------------------------------
@@ -227,8 +251,10 @@ class HostScanner:
         own = {os.getpid()}
         checked = 0
         hits = []
-        for p in psutil.process_iter(["pid", "name", "cmdline", "username"]):
+        for p in psutil.process_iter(["pid", "name", "cmdline", "username", "create_time"]):
             if p.info["pid"] in own or not p.info.get("cmdline"):
+                continue
+            if (p.info.get("name") or "").lower() in _LOOKUP_TOOLS:
                 continue
             checked += 1
             cmd = " ".join(p.info["cmdline"])[:2000]
@@ -239,7 +265,7 @@ class HostScanner:
                     found.append({"type": kind, "value": value, "ioc_matches": matches})
             if found:
                 hits.append({"pid": p.info["pid"], "process": p.info["name"], "user": p.info.get("username"),
-                             "cmdline": cmd[:300], "indicators": found})
+                             "cmdline": cmd[:300], "indicators": found, "observed_at": p.info.get("create_time")})
         return {"processes_checked": checked, **self._cap(hits)}
 
     # --- authentication logs ------------------------------------------------
@@ -256,6 +282,7 @@ class HostScanner:
                 "ip": ip, "failures": d["failures"], "accepted": d["accepted"],
                 "users_tried": sorted(u for u in d["users"] if u)[:10],
                 "brute_force": d["failures"] >= threshold,
+                "observed_at": d["last"],
                 "known_malicious": bool(matches),
                 "ioc_matches": matches,
             })
@@ -336,7 +363,7 @@ def _read_auth_logs(minutes: int) -> tuple[str, list[str], str]:
                         "OpenSSH Server event log not available (install the 'OpenSSH Server' optional feature)")
             return "OpenSSH/Operational", proc.stdout.splitlines(), ""
         proc = subprocess.run(
-            ["journalctl", "-u", "ssh", "-u", "sshd", "--since", f"-{minutes}min", "-o", "cat", "--no-pager"],
+            ["journalctl", "-u", "ssh", "-u", "sshd", "--since", f"-{minutes}min", "-o", "short-iso", "--no-pager"],
             capture_output=True, text=True, timeout=30,
         )
         if proc.returncode == 0 and proc.stdout.strip():

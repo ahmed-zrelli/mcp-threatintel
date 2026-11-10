@@ -172,9 +172,17 @@ class AlertEngine:
 
     def _handle(self, finding: Finding) -> int | None:
         keys = finding_keys(finding)
+        prev = self.db.latest_alert(finding.key)
+
+        # 0. An observation that is not newer than the last detection of the same finding is the same
+        #    event seen again by a later scan (scans remember recent activity): ignore it entirely.
+        observed = finding.detail.get("observed_at")
+        if prev and observed:
+            last = datetime.fromisoformat(prev.get("last_seen") or prev["ts"]).timestamp()
+            if float(observed) <= last:
+                return None
 
         # 1. Exactly the same finding, still being handled: count it, no new alert.
-        prev = self.db.latest_alert(finding.key)
         if prev and self._is_open(prev):
             self.db.bump_alert(prev["id"])
             if prev.get("incident_id"):
@@ -203,7 +211,8 @@ class AlertEngine:
         containing = [a for a in actions if a.get("type") != "kill_process"]
         contained = bool(containing) and all(a.get("duplicate") and a.get("status") == "executed"
                                              for a in containing)
-        if contained and incident is not None:
+        # Only a connection means malware is still retrying; a sinkholed name never reaches DNS again.
+        if contained and incident is not None and finding.kind == "c2_connection":
             self.db.update_incident(incident["id"], blocked_attempt=True)
             if incident["persisting_notified"]:
                 if prev:
