@@ -117,10 +117,11 @@ def test_notifier_first_run_summarises_then_shows_only_new(tmp_path, monkeypatch
     shown = []
     monkeypatch.setattr(watcher, "notify", lambda title, lines: shown.append(title) or True)
 
-    async def fake_show(mcp, alert, args, toast):
-        shown.append(f"alert {alert['id']}")
+    async def fake_investigate(mcp, alert, args, toast):
+        shown.append(f"investigated {alert['id']}")
 
-    monkeypatch.setattr(watcher, "show", fake_show)
+    monkeypatch.setattr(watcher, "announce", lambda alert, toast: shown.append(f"alert {alert['id']}"))
+    monkeypatch.setattr(watcher, "investigate_alert", fake_investigate)
     alerts = [{"id": i, "severity": "high", "title": f"t{i}", "actions": []} for i in (1, 2)]
     last = watcher.LastSeen(tmp_path / "last.txt")
     mcp = AlertsMCP(alerts)
@@ -128,4 +129,8 @@ def test_notifier_first_run_summarises_then_shows_only_new(tmp_path, monkeypatch
     assert shown == ["ThreatIntel - 2 alert(s) on the server"] and last.get() == 2   # no replay of old alerts
     alerts.append({"id": 3, "severity": "critical", "title": "t3", "actions": []})
     asyncio.run(watcher.poll(mcp, last, SimpleNamespace(no_ai=True)))
-    assert shown[-1] == "alert 3" and last.get() == 3
+    assert shown[-2:] == ["alert 3", "investigated 3"] and last.get() == 3
+    jobs = asyncio.Queue()                                     # background mode: announced now, queued
+    alerts.append({"id": 4, "severity": "high", "title": "t4", "actions": []})
+    asyncio.run(watcher.poll(mcp, last, SimpleNamespace(no_ai=True), jobs))
+    assert shown[-1] == "alert 4" and jobs.qsize() == 1

@@ -97,7 +97,8 @@ async def llm_available(url: str) -> bool:
         return False
 
 
-async def show(mcp, alert: dict, args, toast: bool) -> None:
+def announce(alert: dict, toast: bool) -> None:
+    """Instant part: the notification as soon as the server raised the alert."""
     actions = alert.get("actions") or []
     sev = alert.get("severity", "?").upper()
     if toast:
@@ -107,6 +108,16 @@ async def show(mcp, alert: dict, args, toast: bool) -> None:
     for a in actions:
         out(f"    - {describe(a)}")
     out(f"    {approve_hint(actions)}")
+
+
+async def show(mcp, alert: dict, args, toast: bool) -> None:
+    announce(alert, toast)
+    await investigate_alert(mcp, alert, args, toast)
+
+
+async def investigate_alert(mcp, alert: dict, args, toast: bool) -> None:
+    """Slow part (model): evidence, report, resolution. Runs in the background."""
+    actions = alert.get("actions") or []
     full = _text(await mcp.call_tool("list_alerts", {"alert_id": alert["id"]}))
     if not isinstance(full, dict) or full.get("error"):
         full = alert
@@ -191,9 +202,13 @@ def basic_report(alert: dict, actions: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def poll(mcp, last: LastSeen, args) -> None:
+async def poll(mcp, last: LastSeen, args, jobs: asyncio.Queue | None = None) -> None:
+    """One long poll: the server answers as soon as a new alert exists (or after wait_s)."""
     since = last.get()
-    alerts = _text(await mcp.call_tool("list_alerts", {"since_id": since or 0, "limit": 50}))
+    params = {"since_id": since or 0, "limit": 50}
+    if since is not None:
+        params["wait_s"] = getattr(args, "wait", 25)
+    alerts = _text(await mcp.call_tool("list_alerts", params))
     if isinstance(alerts, dict):
         raise RuntimeError(alerts.get("error", "list_alerts failed"))
     if not alerts:
@@ -209,8 +224,13 @@ async def poll(mcp, last: LastSeen, args) -> None:
         last.set(alerts[-1]["id"])
         return
     for i, alert in enumerate(alerts):
-        await show(mcp, alert, args, toast=i < MAX_TOASTS_PER_POLL)
+        toast = i < MAX_TOASTS_PER_POLL
+        announce(alert, toast)
         last.set(alert["id"])
+        if jobs is not None:
+            jobs.put_nowait((alert, toast))
+        else:
+            await investigate_alert(mcp, alert, args, toast)
     if len(alerts) > MAX_TOASTS_PER_POLL:
         notify(f"ThreatIntel - {len(alerts)} new alerts", ["More alerts than notifications shown.",
                                                           "On the server: threatintel-approve alerts"])
@@ -219,19 +239,32 @@ async def poll(mcp, last: LastSeen, args) -> None:
 async def run(args) -> None:
     last = LastSeen(STATE_DIR / "watch_last_alert.txt")
     token = os.getenv("MCP_THREATINTEL_AUTH_TOKEN") or None
-    out(f"threatintel-watch: server {args.mcp_url}, polling every {args.interval}s, "
+    out(f"threatintel-watch: server {args.mcp_url}, alerts pushed by long polling (<= {args.wait}s wait), "
         f"AI {'off' if args.no_ai else args.llm_url}")
+    jobs: asyncio.Queue = asyncio.Queue()
     warned = False
     while True:
         try:
             async with Client(args.mcp_url, auth=token) as mcp:
                 out("connected to the MCP server")
                 warned = False
-                while True:
-                    await poll(mcp, last, args)
-                    if args.once:
-                        return
-                    await asyncio.sleep(args.interval)
+
+                async def investigator():
+                    while True:
+                        alert, toast = await jobs.get()
+                        try:
+                            await investigate_alert(mcp, alert, args, toast)
+                        except Exception as e:
+                            out(f"    investigation of alert #{alert.get('id')} failed: {e}")
+
+                worker = asyncio.create_task(investigator())
+                try:
+                    while True:
+                        await poll(mcp, last, args, None if args.once else jobs)
+                        if args.once:
+                            return
+                finally:
+                    worker.cancel()
         except Exception as e:
             if not warned:
                 out(f"MCP server unreachable ({e}); retrying every {args.interval}s")
@@ -250,7 +283,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--mcp-url", default=os.getenv("WATCH_MCP_URL", "http://127.0.0.1:3707/mcp"))
     p.add_argument("--llm-url", default=os.getenv("WATCH_LLM_URL", "http://127.0.0.1:8080"))
     p.add_argument("--interval", type=int, default=int(os.getenv("WATCH_INTERVAL", "15")),
-                   help="seconds between alert polls")
+                   help="seconds between reconnection attempts when the server is unreachable")
+    p.add_argument("--wait", type=float, default=25, help="long-poll wait on the server (max 25 s)")
     p.add_argument("--llm-timeout", type=float, default=300)
     p.add_argument("--no-ai", action="store_true", help="notifications only, no model analysis")
     p.add_argument("--once", action="store_true", help="one poll, then exit")

@@ -1,7 +1,10 @@
 """AlertEngine: always-on detection inside the host agent.
 
-Every ``interval_s`` seconds it runs the full host scan (every poller
-indicator, see scanner.py), and for each NEW finding:
+Event-driven: the collectors call on_connection / on_dns / on_file the moment
+they see something new; a match against the indicator index raises the alert
+within about a second. Every ``interval_s`` seconds a full host scan (every
+poller indicator, see scanner.py) also runs as a safety net (processes, SSH
+logs, anything an event missed). For each NEW finding:
   * creates the suggested response actions as PENDING (requested_by
     "auto-detect"; validation, allowlist and duplicate checks apply, and
     nothing is ever approved here);
@@ -16,6 +19,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import queue
+import threading
 from datetime import datetime, timedelta, timezone
 
 from .actions import ActionManager
@@ -45,6 +50,52 @@ class AlertEngine:
         self.forensics = Forensics(scanner, db) if hasattr(scanner, "iocs") else None
         self.last_run: str | None = None
         self.last_error: str | None = None
+        self.events: queue.Queue = queue.Queue(maxsize=1000)
+        self.on_alert = None            # callback(alert_id), e.g. wakes long-polling notifiers
+        self._lock = threading.Lock()   # periodic scan and events never alert the same thing twice
+        self.event_alerts = 0
+
+    # --- event-driven detection (called from collector threads / the event loop) ---
+
+    def _submit(self, item) -> None:
+        try:
+            self.events.put_nowait(item)
+        except queue.Full:
+            logger.warning("event queue full; the periodic scan will catch up")
+
+    def on_connection(self, rec: dict) -> None:
+        matches = self.scanner.iocs.lookup("ip", rec.get("remote_ip") or "")
+        if matches:
+            self._submit(("report", {"connections": {"malicious": [{**rec, "active": True, "ioc_matches": matches}]}}))
+
+    def on_dns(self, name: str, rec: dict) -> None:
+        matches = self.scanner.iocs.lookup_domain(name)
+        if matches:
+            self._submit(("report", {"dns": {"malicious": [{"domain": name, "lookups": rec.get("count", 1),
+                                                            "answers": rec.get("answers", []),
+                                                            "ioc_matches": matches}]}}))
+
+    def on_file(self, path: str) -> None:
+        self._submit(("file", path))  # hashing happens in the worker, not in the event loop
+
+    def process_event(self, item) -> list[int]:
+        kind, payload = item
+        if kind == "file":
+            hit = self.scanner.check_file(payload)
+            if not hit:
+                return []
+            payload = {"files": {"malicious": [hit]}}
+        ids = [a for a in (self.handle(f) for f in extract_findings(payload)) if a]
+        self.event_alerts += len(ids)
+        return ids
+
+    async def run_events(self) -> None:
+        while True:
+            item = await asyncio.to_thread(self.events.get)
+            try:
+                await asyncio.to_thread(self.process_event, item)
+            except Exception:
+                logger.exception("event handling error")
 
     def _create(self, tool: str, args: dict) -> dict:
         key = ACTION_PARAM[tool]
@@ -54,6 +105,16 @@ class AlertEngine:
             return {"id": None, "type": tool, "status": "rejected", "error": str(e)}
 
     def handle(self, finding: Finding) -> int | None:
+        with self._lock:
+            alert_id = self._handle(finding)
+        if alert_id and self.on_alert:
+            try:
+                self.on_alert(alert_id)
+            except Exception:
+                logger.exception("on_alert callback failed")
+        return alert_id
+
+    def _handle(self, finding: Finding) -> int | None:
         since = (datetime.now(timezone.utc) - timedelta(hours=self.realert_hours)).isoformat(timespec="seconds")
         if self.db.alerted_since(finding.key, since):
             return None

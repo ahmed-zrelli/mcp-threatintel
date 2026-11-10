@@ -6,18 +6,27 @@
   ``resolvectl monitor --json=short`` (systemd-resolved; all local programs
   and the host-network containers resolve through the 127.0.0.53 stub).
 
-Both keep a bounded, time-limited memory; scans read it.
+* FileWatcher - Linux inotify (ctypes, no extra package): a file closed after
+  writing, or moved into a watched folder, is reported at once.
+
+Both keep a bounded, time-limited memory; scans read it. Each collector also
+calls an ``on_new`` callback the first time it sees something, so detection is
+event-driven (the periodic scan remains as a safety net).
 """
 
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 import logging
+import os
 import shutil
+import struct
 import sys
 import time
 from collections import OrderedDict
+from pathlib import Path
 
 import psutil
 
@@ -59,9 +68,10 @@ class _Ring:
 
 
 class ConnectionSampler:
-    def __init__(self, interval_s: float = 2.0):
+    def __init__(self, interval_s: float = 2.0, on_new=None):
         self.interval_s = interval_s
         self.seen = _Ring()
+        self.on_new = on_new  # callback(record) for an endpoint not seen in the last hour
 
     def sample(self, now: float | None = None) -> None:
         now = now or time.time()
@@ -72,10 +82,17 @@ class ConnectionSampler:
         for c in conns:
             if not c.raddr:
                 continue
-            self.seen.upsert((c.raddr.ip, c.raddr.port, c.pid), now,
+            key = (c.raddr.ip, c.raddr.port, c.pid)
+            is_new = key not in self.seen.items
+            self.seen.upsert(key, now,
                              remote_ip=c.raddr.ip, remote_port=c.raddr.port,
                              local_port=c.laddr.port if c.laddr else None,
                              status=c.status, pid=c.pid, process=_proc_name(c.pid))
+            if is_new and self.on_new:
+                try:
+                    self.on_new(dict(self.seen.items[key]))
+                except Exception:  # a callback problem must never stop sampling
+                    logger.exception("connection callback failed")
 
     async def run(self) -> None:
         while True:
@@ -84,8 +101,9 @@ class ConnectionSampler:
 
 
 class DnsMonitor:
-    def __init__(self):
+    def __init__(self, on_new=None):
         self.seen = _Ring()
+        self.on_new = on_new  # callback(name, record) for a name not resolved in the last hour
         self.available = sys.platform != "win32" and shutil.which("resolvectl") is not None
         self.status = "starting" if self.available else "unavailable (needs systemd-resolved)"
 
@@ -106,8 +124,14 @@ class DnsMonitor:
         for q in msg.get("question") or []:
             name = (q.get("name") or "").lower().rstrip(".")
             if name:
+                is_new = name not in self.seen.items
                 prev = self.seen.items.get(name, {}).get("answers", [])
                 self.seen.upsert(name, now, domain=name, answers=sorted(set(prev + answers))[:10])
+                if is_new and self.on_new:
+                    try:
+                        self.on_new(name, dict(self.seen.items[name]))
+                    except Exception:
+                        logger.exception("DNS callback failed")
 
     async def run(self) -> None:
         if not self.available:
@@ -128,3 +152,93 @@ class DnsMonitor:
                 self.status = f"error: {e}"
                 logger.warning("DNS monitor: %s", e)
             await asyncio.sleep(10)
+
+
+# --- inotify file watcher ------------------------------------------------------
+
+IN_CLOSE_WRITE = 0x00000008
+IN_MOVED_TO = 0x00000080
+IN_CREATE = 0x00000100
+IN_Q_OVERFLOW = 0x00004000
+IN_IGNORED = 0x00008000
+IN_ISDIR = 0x40000000
+IN_NONBLOCK = 0o4000
+IN_CLOEXEC = 0o2000000
+_MASK = IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE
+_EVENT = struct.Struct("iIII")
+
+
+def parse_inotify(data: bytes) -> list[tuple[int, int, str]]:
+    """(watch descriptor, mask, name) for each struct inotify_event in a read buffer."""
+    out, off = [], 0
+    while off + _EVENT.size <= len(data):
+        wd, mask, _cookie, length = _EVENT.unpack_from(data, off)
+        name = data[off + _EVENT.size: off + _EVENT.size + length].split(b"\0", 1)[0]
+        out.append((wd, mask, os.fsdecode(name)))
+        off += _EVENT.size + length
+    return out
+
+
+class FileWatcher:
+    """Reports files written or moved into the watched folders (and their sub-folders)."""
+
+    def __init__(self, paths: list[Path], on_file, max_dirs: int = 2000):
+        self.paths = [Path(p) for p in paths]
+        self.on_file = on_file
+        self.max_dirs = max_dirs
+        self.wds: dict[int, str] = {}
+        self.fd = -1
+        self.available = sys.platform.startswith("linux")
+        self.status = "starting" if self.available else "unavailable (Linux inotify only)"
+
+    def start(self, loop: asyncio.AbstractEventLoop) -> None:
+        if not self.available:
+            return
+        try:
+            self._libc = ctypes.CDLL(None, use_errno=True)
+            self.fd = self._libc.inotify_init1(IN_NONBLOCK | IN_CLOEXEC)
+            if self.fd < 0:
+                raise OSError(ctypes.get_errno(), "inotify_init1 failed")
+            for root in self.paths:
+                if root.is_dir():
+                    for dirpath, _dirs, _files in os.walk(root):
+                        if not self._add(dirpath):
+                            break
+            loop.add_reader(self.fd, self._readable)
+            self.status = f"watching {len(self.wds)} folder(s)"
+        except Exception as e:
+            self.status = f"error: {e}"
+            logger.warning("file watcher: %s", e)
+
+    def _add(self, directory: str) -> bool:
+        if len(self.wds) >= self.max_dirs:
+            return False
+        wd = self._libc.inotify_add_watch(self.fd, os.fsencode(directory), _MASK)
+        if wd >= 0:
+            self.wds[wd] = directory
+        return True
+
+    def _readable(self) -> None:
+        try:
+            data = os.read(self.fd, 65536)
+        except (BlockingIOError, InterruptedError):
+            return
+        for wd, mask, name in parse_inotify(data):
+            if mask & IN_Q_OVERFLOW:
+                self.status = "queue overflow (the periodic scan covers the gap)"
+                continue
+            if mask & IN_IGNORED:
+                self.wds.pop(wd, None)
+                continue
+            base = self.wds.get(wd)
+            if not base or not name:
+                continue
+            path = os.path.join(base, name)
+            if mask & IN_ISDIR:
+                if mask & (IN_CREATE | IN_MOVED_TO):
+                    self._add(path)
+            elif mask & (IN_CLOSE_WRITE | IN_MOVED_TO):
+                try:
+                    self.on_file(path)
+                except Exception:
+                    logger.exception("file callback failed")

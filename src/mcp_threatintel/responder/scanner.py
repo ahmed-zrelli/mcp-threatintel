@@ -199,6 +199,28 @@ class HostScanner:
         return {"scanned_paths": [str(r) for r in roots], "files_scanned": scanned, "files_skipped": skipped,
                 "limit_reached": scanned >= MAX_FILES, **self._cap(hits)}
 
+    def check_file(self, path: str) -> dict | None:
+        """One file (event-driven detection): a scan_files-style hit, or None.
+        Only files inside the scan paths are checked."""
+        p = Path(path)
+        try:
+            rp = p.resolve()
+            if not any(rp == r or rp.is_relative_to(r) for r in (x.resolve() for x in self.config.scan_paths)):
+                return None
+            st = rp.stat()
+            if not rp.is_file() or rp.is_symlink() or st.st_size > MAX_FILE_BYTES:
+                return None
+            hashes = hash_file(rp)
+            self._hash_cache[str(rp)] = (st.st_size, st.st_mtime, hashes)
+        except OSError:
+            return None
+        for algo, digest in hashes.items():
+            matches = self.iocs.lookup("hash", digest)
+            if matches:
+                return {"path": str(rp), "size": st.st_size, "sha256": hashes["sha256"],
+                        "matched_hash": algo, "ioc_matches": matches}
+        return None
+
     # --- processes ----------------------------------------------------------
 
     def scan_processes(self) -> dict:

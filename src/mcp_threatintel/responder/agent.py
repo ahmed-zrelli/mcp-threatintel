@@ -29,7 +29,7 @@ from .config import ResponderConfig
 from .iocs import IocIndex
 from .alerts import AlertEngine
 from .autonomy import Autonomy
-from .monitor import ConnectionSampler, DnsMonitor
+from .monitor import ConnectionSampler, DnsMonitor, FileWatcher
 from .protocol import serve
 from .scanner import HostScanner
 from .store import ResponderDB, now_iso
@@ -85,6 +85,13 @@ class HostAgent:
         self.manager = ActionManager(self.db, self.allowlist, self.iocs, config)
         self.detector = AlertEngine(self.db, self.manager, self.scanner, interval_s=config.detect_interval)
         self.autonomy = Autonomy(self.db, self.manager, config)
+        # Event-driven detection: collectors report new observables straight to the engine.
+        self.sampler.on_new = self.detector.on_connection
+        self.dns.on_new = self.detector.on_dns
+        self.files = FileWatcher(config.scan_paths, self.detector.on_file)
+        self.detector.on_alert = self._alert_raised
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._new_alert = asyncio.Event()
         # One backend set per mode, chosen by each action's own dry_run flag, so an
         # action executed for real is also rolled back for real (and vice versa).
         self.backends = backends or {
@@ -129,7 +136,8 @@ class HostAgent:
                     "dns_monitor": self.dns.status, "indicators_indexed": self.iocs.counts,
                     "auto_detect": self.config.auto_detect, "detect_interval_s": self.config.detect_interval,
                     "last_detection_run": self.detector.last_run, "detection_error": self.detector.last_error,
-                    "autonomy": self.autonomy.status()}
+                    "autonomy": self.autonomy.status(), "file_watcher": self.files.status,
+                    "event_alerts": self.detector.event_alerts}
         if op == "scan_connections":
             return await asyncio.to_thread(self.scanner.scan_connections, int(p.get("minutes", 10)))
         if op == "scan_dns":
@@ -145,7 +153,20 @@ class HostAgent:
                 alert["detail"].pop("actions", None)
                 alert["autonomy"] = self.autonomy.status()
                 return alert
-            alerts = self.db.list_alerts(int(p.get("since_id") or 0), max(1, min(int(p.get("limit", 20)), 200)))
+            since, limit = int(p.get("since_id") or 0), max(1, min(int(p.get("limit", 20)), 200))
+            wait = max(0.0, min(float(p.get("wait_s") or 0), 25.0))  # long polling for notifiers
+            deadline = asyncio.get_running_loop().time() + wait
+            while True:
+                self._new_alert.clear()
+                alerts = self.db.list_alerts(since, limit)
+                left = deadline - asyncio.get_running_loop().time()
+                if alerts or not since or left <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(self._new_alert.wait(), timeout=left)
+                except asyncio.TimeoutError:
+                    alerts = self.db.list_alerts(since, limit)
+                    break
             for a in alerts:  # current status of the actions; evidence only via alert_id (keeps lists small)
                 a["actions"] = [summarize(x) for x in (self.db.get_action(i) for i in a["action_ids"]) if x]
                 a["detail"].pop("actions", None)
@@ -262,6 +283,11 @@ class HostAgent:
         self.manager.transition(original["id"], "rolled_back", "responder",
                                 result={"state": state, "rolled_back_by": action["id"]})
 
+    def _alert_raised(self, alert_id: int) -> None:
+        """Called from worker threads: wake any notifier waiting in list_alerts."""
+        if self._loop:
+            self._loop.call_soon_threadsafe(self._new_alert.set)
+
     def _rollback_state(self, action: dict) -> dict:
         """Saved backend state, plus the IPs another executed block still needs."""
         state = dict((action.get("result") or {}).get("state") or {})
@@ -328,9 +354,13 @@ class HostAgent:
                     self.config.agent_addr, self.config.admin_addr, self.config.dry_run,
                     len(self.allowlist.entries))
         self._collectors = [asyncio.create_task(self.sampler.run()), asyncio.create_task(self.dns.run())]
+        self._loop = asyncio.get_running_loop()
         if self.config.auto_detect:
             self._collectors.append(asyncio.create_task(self.detector.run()))
-            logger.info("always-on detection every %ds", self.config.detect_interval)
+            self._collectors.append(asyncio.create_task(self.detector.run_events()))
+            self.files.start(self._loop)
+            logger.info("detection: event-driven (DNS live, connections every 2 s, files: %s) "
+                        "+ full scan every %ds", self.files.status, self.config.detect_interval)
         async with agent_srv, admin_srv:
             while True:
                 try:
