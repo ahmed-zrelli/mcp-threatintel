@@ -115,3 +115,65 @@ def test_engine_queue_is_bounded():
     eng._submit(("file", "a"))
     eng._submit(("file", "b"))                                        # dropped, never blocks a collector
     assert eng.events.qsize() == 1
+
+
+# --- repeats: count while open, RECURRING alert after resolution / quiet period ----------
+
+
+def _dns_report(domain="c2.lab.test"):
+    return {"dns": {"malicious": [{"domain": domain, "lookups": 1, "ioc_matches": [{"source": "local"}]}]}}
+
+
+def test_repeat_while_open_is_counted_not_realerted(agent):  # noqa: F811
+    eng = agent.detector
+    [first] = eng.process_event(("report", _dns_report()))
+    assert eng.process_event(("report", _dns_report())) == []
+    assert agent.db.get_alert(first)["occurrences"] == 2
+
+
+def test_repeat_after_resolution_raises_a_louder_recurring_alert(agent):  # noqa: F811
+    eng = agent.detector
+    [first] = eng.process_event(("report", _dns_report()))
+    agent.config.autonomy = True
+    agent.autonomy.resolve(first, "execute", "Lab C2 domain confirmed, sinkhole it.")
+    [second] = eng.process_event(("report", _dns_report()))            # attacked again right after
+    alert = agent.db.get_alert(second)
+    assert alert["recurrence_of"] == first and alert["title"].startswith("RECURRING (after alert #")
+    assert alert["severity"] == "critical"                             # was high
+    assert alert["detail"]["previous_resolution"] == "executed"
+
+
+def test_repeat_after_a_quiet_period_alerts_again(agent):  # noqa: F811
+    eng = agent.detector
+    [first] = eng.process_event(("report", _dns_report()))
+    agent.db._conn.execute("UPDATE alerts SET last_seen = '2000-01-01T00:00:00+00:00' WHERE id = ?", (first,))
+    agent.db._conn.commit()
+    [second] = eng.process_event(("report", _dns_report()))
+    assert agent.db.get_alert(second)["recurrence_of"] == first
+
+
+def test_redropped_file_gets_a_new_quarantine_action(agent, config):  # noqa: F811
+    f = config.scan_paths[0] / "evil.bin"
+    f.write_bytes(b"x")
+    a1 = agent.manager.create("quarantine_file", {"path": str(f)}, "first drop", "auto-detect")
+    agent.manager.approve(a1["id"], "analyst:alice")
+    agent.manager.transition(a1["id"], "executed", "responder")         # file was quarantined
+    a2 = agent.manager.create("quarantine_file", {"path": str(f)}, "dropped again", "auto-detect")
+    assert a2["id"] != a1["id"] and not a2.get("duplicate")
+    b1 = agent.manager.create("block_ip", {"ip": "45.1.2.3"}, "c2", "auto-detect")
+    agent.manager.approve(b1["id"], "analyst:alice")
+    agent.manager.transition(b1["id"], "executed", "responder")
+    b2 = agent.manager.create("block_ip", {"ip": "45.1.2.3"}, "c2 again", "auto-detect")
+    assert b2["id"] == b1["id"] and b2["duplicate"]                     # the block is still in force
+
+
+def test_collectors_react_again_after_a_short_gap():
+    from mcp_threatintel.responder.monitor import REPEAT_GAP_S
+
+    seen = []
+    dns = DnsMonitor(on_new=lambda name, rec: seen.append(name))
+    line = json.dumps({"question": [{"name": "c2.lab.test"}]})
+    dns.handle_line(line, now=1000)
+    dns.handle_line(line, now=1010)                                     # same burst: ignored
+    dns.handle_line(line, now=1010 + REPEAT_GAP_S + 1)                  # attack repeated later: reported
+    assert seen == ["c2.lab.test", "c2.lab.test"]

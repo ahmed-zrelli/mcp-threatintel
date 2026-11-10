@@ -34,6 +34,7 @@ logger = logging.getLogger("threatintel.responder.monitor")
 
 KEEP_S = 3600          # remember observations for one hour
 MAX_ENTRIES = 5000
+REPEAT_GAP_S = 60      # seen again after this gap = a new event (a repeated attack is reported at once)
 
 
 def _proc_name(pid):
@@ -83,7 +84,8 @@ class ConnectionSampler:
             if not c.raddr:
                 continue
             key = (c.raddr.ip, c.raddr.port, c.pid)
-            is_new = key not in self.seen.items
+            old = self.seen.items.get(key)
+            is_new = old is None or now - old["last_seen"] > REPEAT_GAP_S
             self.seen.upsert(key, now,
                              remote_ip=c.raddr.ip, remote_port=c.raddr.port,
                              local_port=c.laddr.port if c.laddr else None,
@@ -124,7 +126,8 @@ class DnsMonitor:
         for q in msg.get("question") or []:
             name = (q.get("name") or "").lower().rstrip(".")
             if name:
-                is_new = name not in self.seen.items
+                old = self.seen.items.get(name)
+                is_new = old is None or now - old["last_seen"] > REPEAT_GAP_S
                 prev = self.seen.items.get(name, {}).get("answers", [])
                 self.seen.upsert(name, now, domain=name, answers=sorted(set(prev + answers))[:10])
                 if is_new and self.on_new:

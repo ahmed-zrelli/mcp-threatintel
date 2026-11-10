@@ -83,7 +83,8 @@ class HostAgent:
         self.dns = DnsMonitor()
         self.scanner = HostScanner(config, self.iocs, self.sampler, self.dns)
         self.manager = ActionManager(self.db, self.allowlist, self.iocs, config)
-        self.detector = AlertEngine(self.db, self.manager, self.scanner, interval_s=config.detect_interval)
+        self.detector = AlertEngine(self.db, self.manager, self.scanner, interval_s=config.detect_interval,
+                                    aggregate_minutes=config.alert_aggregate_minutes)
         self.autonomy = Autonomy(self.db, self.manager, config)
         # Event-driven detection: collectors report new observables straight to the engine.
         self.sampler.on_new = self.detector.on_connection

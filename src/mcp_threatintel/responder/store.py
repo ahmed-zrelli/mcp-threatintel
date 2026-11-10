@@ -98,7 +98,8 @@ class ResponderDB:
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(alerts)")}
         for col, ddl in (("report", "TEXT"), ("report_by", "TEXT"), ("report_at", "TEXT"),
                          ("resolution", "TEXT"), ("resolution_by", "TEXT"), ("resolution_at", "TEXT"),
-                         ("resolution_note", "TEXT")):
+                         ("resolution_note", "TEXT"), ("occurrences", "INTEGER NOT NULL DEFAULT 1"),
+                         ("last_seen", "TEXT"), ("recurrence_of", "INTEGER")):
             if col not in cols:
                 self._conn.execute(f"ALTER TABLE alerts ADD COLUMN {col} {ddl}")
         self._conn.commit()
@@ -193,12 +194,14 @@ class ResponderDB:
     # --- alerts ---
 
     def insert_alert(self, *, key: str, kind: str, severity: str, title: str, detail: dict,
-                     action_ids: list[int]) -> int:
+                     action_ids: list[int], recurrence_of: int | None = None) -> int:
+        now = now_iso()
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO alerts (ts, key, kind, severity, title, detail_json, action_ids) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (now_iso(), key, kind, severity, title, json.dumps(detail, default=str), json.dumps(action_ids)),
+                "INSERT INTO alerts (ts, key, kind, severity, title, detail_json, action_ids, last_seen, "
+                "recurrence_of) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (now, key, kind, severity, title, json.dumps(detail, default=str), json.dumps(action_ids),
+                 now, recurrence_of),
             )
             self._conn.commit()
             return cur.lastrowid
@@ -231,6 +234,19 @@ class ResponderDB:
             return self._conn.execute(
                 "SELECT COUNT(*) FROM audit_log WHERE actor = ? AND event = ? AND ts >= ?",
                 (actor, event, since_iso)).fetchone()[0]
+
+    def latest_alert(self, key: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute("SELECT id FROM alerts WHERE key = ? ORDER BY id DESC LIMIT 1",
+                                     (key,)).fetchone()
+        return self.get_alert(row["id"]) if row else None
+
+    def bump_alert(self, alert_id: int) -> None:
+        """The same open incident was detected again: count it instead of re-alerting."""
+        with self._lock:
+            self._conn.execute("UPDATE alerts SET occurrences = occurrences + 1, last_seen = ? WHERE id = ?",
+                               (now_iso(), alert_id))
+            self._conn.commit()
 
     def alerted_since(self, key: str, since_iso: str) -> bool:
         with self._lock:

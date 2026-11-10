@@ -135,7 +135,11 @@ class ActionManager:
 
     def _find_active(self, type_: str, target: str) -> dict | None:
         """A pending, approved or still-executed action of the same type on the same target."""
-        for status in ("pending", "approved", "executed"):
+        # An executed block or sinkhole is still in force, so it is reused. An executed quarantine
+        # or kill concerned a file/process that no longer exists: a re-dropped file needs a new action.
+        statuses = ("pending", "approved") if type_ in ("quarantine_file", "kill_process") \
+            else ("pending", "approved", "executed")
+        for status in statuses:
             for a in self.db.list_actions(status, limit=500):
                 if a["type"] == type_ and a["target"] == target and a["dry_run"] == self.config.dry_run:
                     return a

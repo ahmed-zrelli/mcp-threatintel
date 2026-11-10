@@ -117,7 +117,8 @@ def main(argv: list[str] | None = None) -> None:
         if not alerts:
             print("no alerts")
         for a in alerts:
-            print(f"#{a['id']:<4} {a['ts']}  {a['severity'].upper():<8} {a['title']}")
+            seen = f"  (seen {a['occurrences']}x)" if (a.get("occurrences") or 1) > 1 else ""
+            print(f"#{a['id']:<4} {a['ts']}  {a['severity'].upper():<8} {a['title']}{seen}")
             for x in a.get("actions", []):
                 print(f"        action {x['id']}: {x['type']} {x['target'][:40]} -> {x['status']}")
     elif args.cmd == "alert":
