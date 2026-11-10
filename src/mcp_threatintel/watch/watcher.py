@@ -1,14 +1,16 @@
-"""threatintel-watch: the always-on loop.
+"""threatintel-watch: the analyst PC's notifier.
 
-    threatintel-watch --mcp-url http://192.168.21.129:3707/mcp
+Detection runs on the server, all the time, inside the host agent (AlertEngine):
+it scans, records alerts and creates the pending actions even when this PC is
+off. This program only:
+  1. polls the server's alerts (MCP tool list_alerts) every --interval seconds;
+  2. shows a Windows notification for each new one, with the approve commands
+     (alerts raised while the PC was off are shown at the next start);
+  3. if the local model (llama-server) is running, lets it investigate the
+     alert and notifies its short analysis.
 
-Every --interval seconds: scan_host on the protected server. For each NEW
-finding (C2 connection, malicious file, SSH brute force):
-  1. create the rule-based response actions as PENDING (the agent refuses
-     duplicates and anything allowlisted);
-  2. show a Windows notification with the approve commands;
-  3. let the local model investigate (lookup_ioc, maybe more actions) and
-     notify its short analysis.
+It starts by itself at Windows logon (scripts/windows/install-watch-autostart.ps1)
+and then runs hidden; its log goes to %LOCALAPPDATA%\\threatintel\\watch.log.
 Nothing is ever approved here: approval stays `threatintel-approve` on the server.
 """
 
@@ -22,31 +24,38 @@ import sys
 import time
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 from fastmcp import Client
 
-from .findings import Finding, SeenStore, extract_findings
 from .llm import investigate
 from .notify import notify
 
+STATE_DIR = Path(os.getenv("LOCALAPPDATA") or Path.home()) / "threatintel"
+MAX_TOASTS_PER_POLL = 3
+_log_file = None
 
-def _ts() -> str:
-    return time.strftime("%H:%M:%S")
+
+def out(msg: str) -> None:
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    if sys.stdout is not None:
+        try:
+            print(line, flush=True)
+        except (OSError, ValueError):
+            pass
+    if _log_file:
+        try:
+            with open(_log_file, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
 
 
-def _text(result) -> dict:
+def _text(result) -> object:
     try:
         return json.loads(result.content[0].text)
     except (ValueError, IndexError, AttributeError):
         return {"error": "unreadable tool result"}
-
-
-def describe(action: dict) -> str:
-    status = action.get("status", "?")
-    if action.get("error") and status != "pending":
-        return f"{action.get('type')} {action.get('target')}: {status} ({action['error']})"
-    dup = " (already existed)" if action.get("duplicate") else ""
-    return f"#{action.get('id')} {action.get('type')} {action.get('target')}: {status}{dup}"
 
 
 def approve_hint(actions: list[dict]) -> str:
@@ -56,108 +65,138 @@ def approve_hint(actions: list[dict]) -> str:
     return "Approve on the server: " + " ; ".join(f"threatintel-approve approve {i}" for i in ids)
 
 
-async def create_planned(mcp, findings: list[Finding]) -> list[dict]:
-    actions: list[dict] = []
-    for f in findings:
-        for tool, args in f.plan:
-            try:
-                data = _text(await mcp.call_tool(tool, args))
-            except Exception as e:
-                data = {"type": tool, "target": str(args), "status": "error", "error": str(e)}
-            data.setdefault("type", tool)
-            actions.append(data)
-    return actions
+def describe(action: dict) -> str:
+    return f"#{action.get('id')} {action.get('type')} {str(action.get('target'))[:50]}: {action.get('status')}"
 
 
-async def handle(mcp, findings: list[Finding], args) -> None:
-    actions = await create_planned(mcp, findings)
-    top = findings[0].severity.upper()  # findings are sorted, most severe first
-    title = findings[0].title if len(findings) == 1 else f"{len(findings)} new threats on the server"
-    lines = [f.title for f in findings][:2] if len(findings) > 1 else [findings[0].detail.get("ioc") or ""]
-    lines.append(approve_hint(actions))
-    shown = notify(f"ThreatIntel {top} - " + title, lines)
+class LastSeen:
+    """Id of the last alert shown, so restarts do not repeat old notifications."""
 
-    print(f"\n[{_ts()}] ===== ALERT ({top}) =====" + ("" if shown else " (notification not shown)"))
-    for f in findings:
-        print(f"  ! [{f.severity}] {f.title}")
+    def __init__(self, path: Path):
+        self.path = path
+
+    def get(self) -> int | None:
+        try:
+            return int(self.path.read_text().strip())
+        except (OSError, ValueError):
+            return None
+
+    def set(self, value: int) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(str(value))
+        except OSError:
+            pass
+
+
+async def llm_available(url: str) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=3) as http:
+            return (await http.get(f"{url.rstrip('/')}/health")).status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+async def show(mcp, alert: dict, args, toast: bool) -> None:
+    actions = alert.get("actions") or []
+    sev = alert.get("severity", "?").upper()
+    if toast:
+        ioc = (alert.get("detail") or {}).get("ioc") or ""
+        notify(f"ThreatIntel {sev} - {alert['title']}", [ioc, approve_hint(actions)])
+    out(f"ALERT #{alert['id']} ({sev}) {alert['title']}")
     for a in actions:
-        print(f"    - {describe(a)}")
-    print(f"  {approve_hint(actions)}")
-
-    if args.no_ai:
+        out(f"    - {describe(a)}")
+    out(f"    {approve_hint(actions)}")
+    if args.no_ai or not await llm_available(args.llm_url):
         return
-    brief = {
-        "new_findings": [{"kind": f.kind, "severity": f.severity, "title": f.title, "detail": f.detail}
-                         for f in findings],
-        "actions_already_created": [
-            {k: a.get(k) for k in ("id", "type", "target", "status", "error")} for a in actions
-        ],
-    }
-    print(f"[{_ts()}] AI investigating (Qwen)...")
+    brief = {"alert": {k: alert.get(k) for k in ("kind", "severity", "title", "detail")},
+             "actions_already_created": [{k: a.get(k) for k in ("id", "type", "target", "status")} for a in actions]}
+    out(f"    AI investigating alert #{alert['id']} (Qwen)...")
     try:
         analysis, more = await investigate(mcp, args.llm_url, json.dumps(brief, default=str), timeout=args.llm_timeout)
     except Exception as e:
-        print(f"[{_ts()}] AI unavailable ({e}); the alert above stands on its own.")
+        out(f"    AI unavailable ({e})")
         return
+    out("    AI analysis: " + analysis.replace("\n", " "))
     new = [a for a in more if a.get("id") not in {x.get("id") for x in actions}]
-    print(f"[{_ts()}] AI analysis:\n  " + analysis.replace("\n", "\n  "))
     for a in new:
-        print(f"    + AI added {describe(a)}")
-    notify("ThreatIntel - AI analysis", [analysis[:200], approve_hint(actions + new) if new else ""])
+        out(f"    + AI added {describe(a)}")
+    if toast:
+        notify(f"ThreatIntel - AI analysis of alert #{alert['id']}",
+               [analysis[:200], approve_hint(actions + new) if new else ""])
+
+
+async def poll(mcp, last: LastSeen, args) -> None:
+    since = last.get()
+    alerts = _text(await mcp.call_tool("list_alerts", {"since_id": since or 0, "limit": 50}))
+    if isinstance(alerts, dict):
+        raise RuntimeError(alerts.get("error", "list_alerts failed"))
+    if not alerts:
+        if since is None:
+            last.set(0)
+        return
+    if since is None:
+        # First run on this PC: summarise what is already there instead of replaying it.
+        worst = sorted(alerts, key=lambda a: ["critical", "high", "medium", "low"].index(a.get("severity", "low")))[0]
+        notify(f"ThreatIntel - {len(alerts)} alert(s) on the server", [f"Latest: {alerts[-1]['title']}",
+                                                                       f"Most severe: {worst['title']}"])
+        out(f"{len(alerts)} existing alert(s) on the server; showing new ones from now on")
+        last.set(alerts[-1]["id"])
+        return
+    for i, alert in enumerate(alerts):
+        await show(mcp, alert, args, toast=i < MAX_TOASTS_PER_POLL)
+        last.set(alert["id"])
+    if len(alerts) > MAX_TOASTS_PER_POLL:
+        notify(f"ThreatIntel - {len(alerts)} new alerts", ["More alerts than notifications shown.",
+                                                          "On the server: threatintel-approve alerts"])
 
 
 async def run(args) -> None:
-    store = Path(os.getenv("LOCALAPPDATA") or Path.home()) / "threatintel" / "watch_seen.json"
-    seen = SeenStore(store, ttl_s=args.seen_ttl_hours * 3600)
+    last = LastSeen(STATE_DIR / "watch_last_alert.txt")
     token = os.getenv("MCP_THREATINTEL_AUTH_TOKEN") or None
-    print(f"[{_ts()}] threatintel-watch: server {args.mcp_url}, every {args.interval}s, "
-          f"AI {'off' if args.no_ai else args.llm_url}")
+    out(f"threatintel-watch: server {args.mcp_url}, polling every {args.interval}s, "
+        f"AI {'off' if args.no_ai else args.llm_url}")
+    warned = False
     while True:
         try:
             async with Client(args.mcp_url, auth=token) as mcp:
-                print(f"[{_ts()}] connected to the MCP server, watching...")
+                out("connected to the MCP server")
+                warned = False
                 while True:
-                    report = _text(await mcp.call_tool("scan_host", {"minutes": args.window}))
-                    if report.get("error"):
-                        print(f"[{_ts()}] scan failed: {report['error']}")
-                    else:
-                        found = extract_findings(report)
-                        fresh = seen.new_only(found)
-                        if fresh:
-                            await handle(mcp, fresh, args)
-                        elif args.verbose:
-                            print(f"[{_ts()}] scan ok, {len(found)} known finding(s), nothing new")
+                    await poll(mcp, last, args)
                     if args.once:
                         return
                     await asyncio.sleep(args.interval)
-        except KeyboardInterrupt:
-            raise
         except Exception as e:
-            print(f"[{_ts()}] MCP server unreachable ({e}); retrying in {args.interval}s")
+            if not warned:
+                out(f"MCP server unreachable ({e}); retrying every {args.interval}s")
+                warned = True
             if args.once:
                 return
             await asyncio.sleep(args.interval)
 
 
 def main(argv: list[str] | None = None) -> None:
+    global _log_file
     load_dotenv()
-    if hasattr(sys.stdout, "reconfigure"):
+    if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
-    p = argparse.ArgumentParser(prog="threatintel-watch", description="Always-on alerting for mcp-threatintel")
+    p = argparse.ArgumentParser(prog="threatintel-watch", description="Alert notifier for mcp-threatintel")
     p.add_argument("--mcp-url", default=os.getenv("WATCH_MCP_URL", "http://127.0.0.1:3707/mcp"))
     p.add_argument("--llm-url", default=os.getenv("WATCH_LLM_URL", "http://127.0.0.1:8080"))
-    p.add_argument("--interval", type=int, default=int(os.getenv("WATCH_INTERVAL", "30")), help="seconds between scans")
-    p.add_argument("--window", type=int, default=10, help="minutes of SSH logs checked for brute force")
-    p.add_argument("--seen-ttl-hours", type=float, default=6, help="forget an alerted finding after this many hours")
+    p.add_argument("--interval", type=int, default=int(os.getenv("WATCH_INTERVAL", "15")),
+                   help="seconds between alert polls")
     p.add_argument("--llm-timeout", type=float, default=300)
-    p.add_argument("--no-ai", action="store_true", help="alerts and pending actions only, no model investigation")
-    p.add_argument("--once", action="store_true", help="one scan, then exit")
-    p.add_argument("--verbose", action="store_true", help="print a line after every scan")
+    p.add_argument("--no-ai", action="store_true", help="notifications only, no model analysis")
+    p.add_argument("--once", action="store_true", help="one poll, then exit")
+    p.add_argument("--log-file", default=str(STATE_DIR / "watch.log"))
     args = p.parse_args(argv)
+    _log_file = args.log_file
+    Path(_log_file).parent.mkdir(parents=True, exist_ok=True)
     try:
         asyncio.run(run(args))
     except KeyboardInterrupt:
-        print("stopped")
+        out("stopped")
 
 
 if __name__ == "__main__":

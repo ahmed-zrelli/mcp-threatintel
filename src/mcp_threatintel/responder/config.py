@@ -65,6 +65,9 @@ class ResponderConfig:
     agent_socket_group: str = "threatintel"
     admin_socket_group: str = "threatintel-admin"
     nft_ruleset_file: Path | None = None
+    # Always-on detection inside the agent (AlertEngine)
+    auto_detect: bool = True
+    detect_interval: int = 30
 
     @property
     def ttl_seconds_per_unit(self) -> int:
@@ -96,4 +99,6 @@ class ResponderConfig:
             agent_socket_group=os.getenv("AGENT_SOCKET_GROUP", "threatintel"),
             admin_socket_group=os.getenv("ADMIN_SOCKET_GROUP", "threatintel-admin"),
             nft_ruleset_file=Path(os.environ["NFT_RULESET_FILE"]) if os.getenv("NFT_RULESET_FILE") else None,
+            auto_detect=_bool("AUTO_DETECT", True),
+            detect_interval=max(10, int(os.getenv("AUTO_DETECT_INTERVAL", "30"))),
         )

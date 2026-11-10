@@ -1,0 +1,85 @@
+"""AlertEngine: always-on detection inside the host agent.
+
+Every ``interval_s`` seconds it runs the full host scan (every poller
+indicator, see scanner.py), and for each NEW finding:
+  * creates the suggested response actions as PENDING (requested_by
+    "auto-detect"; validation, allowlist and duplicate checks apply, and
+    nothing is ever approved here);
+  * records an alert in responder.db.
+
+It runs as part of the systemd service, so detection works 24/7 even when
+the analyst PC is off; the PC notifier (threatintel-watch) only displays the
+alerts and asks the local model for an analysis.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime, timedelta, timezone
+
+from .actions import ActionManager
+from .findings import Finding, extract_findings
+from .scanner import HostScanner
+from .store import ResponderDB
+from .validators import ValidationError
+
+logger = logging.getLogger("threatintel.responder.alerts")
+
+ACTION_PARAM = {  # MCP tool argument -> action parameter
+    "block_ip": "ip", "kill_process": "pid", "quarantine_file": "path", "sinkhole_domain": "domain",
+}
+
+
+class AlertEngine:
+    def __init__(self, db: ResponderDB, manager: ActionManager, scanner: HostScanner, *,
+                 interval_s: int = 30, window_min: int = 10, realert_hours: float = 6):
+        self.db = db
+        self.manager = manager
+        self.scanner = scanner
+        self.interval_s = interval_s
+        self.window_min = window_min
+        self.realert_hours = realert_hours
+        self.last_run: str | None = None
+        self.last_error: str | None = None
+
+    def _create(self, tool: str, args: dict) -> dict:
+        key = ACTION_PARAM[tool]
+        try:
+            return self.manager.create(tool, {key: args[key]}, args.get("reason", ""), "auto-detect")
+        except ValidationError as e:
+            return {"id": None, "type": tool, "status": "rejected", "error": str(e)}
+
+    def handle(self, finding: Finding) -> int | None:
+        since = (datetime.now(timezone.utc) - timedelta(hours=self.realert_hours)).isoformat(timespec="seconds")
+        if self.db.alerted_since(finding.key, since):
+            return None
+        actions = [self._create(tool, args) for tool, args in finding.plan]
+        ids = [a["id"] for a in actions if a.get("id")]
+        detail = {**finding.detail, "actions": [
+            {k: a.get(k) for k in ("id", "type", "target", "status", "duplicate")}
+            | ({"error": (a.get("result") or {}).get("error") or a.get("error")} if a.get("status") == "rejected" else {})
+            for a in actions
+        ]}
+        alert_id = self.db.insert_alert(key=finding.key, kind=finding.kind, severity=finding.severity,
+                                        title=finding.title, detail=detail, action_ids=ids)
+        self.db.append_audit("auto-detect", "alert", None, alert_id=alert_id, severity=finding.severity,
+                             title=finding.title, actions=ids)
+        logger.warning("ALERT #%d [%s] %s -> pending actions %s", alert_id, finding.severity, finding.title, ids)
+        return alert_id
+
+    def tick(self) -> list[int]:
+        report = self.scanner.scan_host(self.window_min)
+        self.last_run = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return [a for a in (self.handle(f) for f in extract_findings(report)) if a]
+
+    async def run(self) -> None:
+        await asyncio.sleep(5)  # let the collectors gather a first sample
+        while True:
+            try:
+                await asyncio.to_thread(self.tick)
+                self.last_error = None
+            except Exception as e:
+                self.last_error = str(e)
+                logger.exception("detection loop error")
+            await asyncio.sleep(self.interval_s)

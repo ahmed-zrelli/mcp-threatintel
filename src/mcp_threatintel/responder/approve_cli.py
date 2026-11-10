@@ -77,6 +77,8 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("reject", help="reject a pending action")
     p.add_argument("id", type=int)
     p.add_argument("--reason", default="")
+    p = sub.add_parser("alerts", help="show alerts from the always-on detection")
+    p.add_argument("--limit", type=int, default=20)
     p = sub.add_parser("audit", help="show the audit log")
     p.add_argument("--id", type=int)
     p.add_argument("--limit", type=int, default=30)
@@ -109,6 +111,14 @@ def main(argv: list[str] | None = None) -> None:
     elif args.cmd == "reject":
         _call(config, "reject", id=args.id, actor=actor, reason=args.reason)
         print(f"action {args.id} rejected")
+    elif args.cmd == "alerts":
+        alerts = _call(config, "list_alerts", limit=args.limit)
+        if not alerts:
+            print("no alerts")
+        for a in alerts:
+            print(f"#{a['id']:<4} {a['ts']}  {a['severity'].upper():<8} {a['title']}")
+            for x in a.get("actions", []):
+                print(f"        action {x['id']}: {x['type']} {x['target'][:40]} -> {x['status']}")
     elif args.cmd == "audit":
         for e in _call(config, "audit", id=args.id, limit=args.limit):
             print(f"{e['ts']}  #{e['action_id'] or '-':<5} {e['actor']:<22} {e['event']:<20} "

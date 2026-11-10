@@ -45,8 +45,9 @@ def notify(title: str, lines: list[str]) -> bool:
     encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     try:
         proc = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
             capture_output=True, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),  # no console flash when run hidden
         )
         return proc.returncode == 0
     except (OSError, subprocess.TimeoutExpired):

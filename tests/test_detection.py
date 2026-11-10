@@ -15,7 +15,7 @@ from mcp_threatintel.responder.config import ResponderConfig
 from mcp_threatintel.responder.iocs import IocIndex
 from mcp_threatintel.responder.monitor import ConnectionSampler, DnsMonitor
 from mcp_threatintel.responder.scanner import HostScanner, extract_observables, hash_file
-from mcp_threatintel.watch.findings import extract_findings
+from mcp_threatintel.responder.findings import extract_findings
 
 
 @pytest.fixture

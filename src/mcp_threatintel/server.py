@@ -402,6 +402,17 @@ async def scan_host(minutes: int = 60) -> str:
     return await _agent_call("scan_host", minutes=minutes)
 
 
+@mcp.tool(annotations=HOST_READ)
+async def list_alerts(since_id: int = 0, limit: int = 10) -> str:
+    """Alerts raised by the server's always-on detection, with their pending actions.
+
+    Args:
+        since_id: Only alerts newer than this id (0 = the latest ones).
+        limit: Maximum number of alerts (default 10).
+    """
+    return await _agent_call("list_alerts", since_id=since_id, limit=limit)
+
+
 # ============================================================
 # C. Response (creates a PENDING action; runs only after human approval)
 # ============================================================

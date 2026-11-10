@@ -15,7 +15,7 @@ RESPONSE_TOOLS = {"block_ip", "kill_process", "quarantine_file", "sinkhole_domai
 
 SYSTEM_PROMPT = (
     "You are the on-call SOC analyst for the Ubuntu server protected by the threatintel MCP tools. "
-    "An automatic scan raised an alert. The obvious response actions were already created as PENDING "
+    "The server's always-on detection raised an alert. The obvious response actions were already created as PENDING "
     "(listed below); creating the same action again just returns the existing one. "
     "1) Confirm the indicators with lookup_ioc. 2) If another response is clearly justified, create it "
     "with a factual reason. 3) Reply with a short alert for the analyst: what happened, how bad it is "

@@ -47,6 +47,19 @@ BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
 BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
 
+-- Alerts raised by the always-on detection loop (AlertEngine).
+CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    key TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    title TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    action_ids TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_key ON alerts(key, ts);
+
 CREATE TABLE IF NOT EXISTS allowlist (
     value TEXT NOT NULL,
     type TEXT NOT NULL,
@@ -163,6 +176,44 @@ class ResponderDB:
         for r in rows:
             d = dict(r)
             d["details"] = json.loads(d.pop("details_json") or "{}")
+            out.append(d)
+        return out
+
+    # --- alerts ---
+
+    def insert_alert(self, *, key: str, kind: str, severity: str, title: str, detail: dict,
+                     action_ids: list[int]) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO alerts (ts, key, kind, severity, title, detail_json, action_ids) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (now_iso(), key, kind, severity, title, json.dumps(detail, default=str), json.dumps(action_ids)),
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
+    def alerted_since(self, key: str, since_iso: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM alerts WHERE key = ? AND ts >= ? LIMIT 1", (key, since_iso)
+            ).fetchone()
+        return row is not None
+
+    def list_alerts(self, since_id: int = 0, limit: int = 50) -> list[dict]:
+        with self._lock:
+            if since_id:
+                rows = self._conn.execute(
+                    "SELECT * FROM alerts WHERE id > ? ORDER BY id LIMIT ?", (since_id, limit)
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM (SELECT * FROM alerts ORDER BY id DESC LIMIT ?) ORDER BY id", (limit,)
+                ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["detail"] = json.loads(d.pop("detail_json") or "{}")
+            d["action_ids"] = json.loads(d["action_ids"] or "[]")
             out.append(d)
         return out
 

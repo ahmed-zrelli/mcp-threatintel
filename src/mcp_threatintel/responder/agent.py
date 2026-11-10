@@ -27,6 +27,7 @@ from .backends import BackendError, CommandRunner, build_backends
 from .backends.nftables import NftablesBackend
 from .config import ResponderConfig
 from .iocs import IocIndex
+from .alerts import AlertEngine
 from .monitor import ConnectionSampler, DnsMonitor
 from .protocol import serve
 from .scanner import HostScanner
@@ -36,10 +37,10 @@ from .validators import Allowlist, ValidationError, discover_allowlist, load_all
 logger = logging.getLogger("threatintel.responder")
 
 AGENT_OPS = {
-    "ping", "scan_connections", "scan_files", "scan_auth_logs", "scan_host", "scan_dns", "scan_processes",
+    "ping", "scan_connections", "scan_files", "scan_auth_logs", "scan_host", "scan_dns", "scan_processes", "list_alerts",
     "create_action", "get_action", "list_actions", "request_rollback",
 }
-ADMIN_OPS = {"ping", "list_actions", "get_action", "approve", "reject", "audit"}
+ADMIN_OPS = {"ping", "list_actions", "get_action", "approve", "reject", "audit", "list_alerts"}
 
 
 def summarize(action: dict) -> dict:
@@ -80,6 +81,7 @@ class HostAgent:
         self.dns = DnsMonitor()
         self.scanner = HostScanner(config, self.iocs, self.sampler, self.dns)
         self.manager = ActionManager(self.db, self.allowlist, self.iocs, config)
+        self.detector = AlertEngine(self.db, self.manager, self.scanner, interval_s=config.detect_interval)
         # One backend set per mode, chosen by each action's own dry_run flag, so an
         # action executed for real is also rolled back for real (and vice versa).
         self.backends = backends or {
@@ -121,13 +123,21 @@ class HostAgent:
         if op == "ping":
             return {"agent": "ok", "channel": channel, "dry_run": self.config.dry_run,
                     "platform": sys.platform, "allowlist_entries": len(self.allowlist.entries),
-                    "dns_monitor": self.dns.status, "indicators_indexed": self.iocs.counts}
+                    "dns_monitor": self.dns.status, "indicators_indexed": self.iocs.counts,
+                    "auto_detect": self.config.auto_detect, "detect_interval_s": self.config.detect_interval,
+                    "last_detection_run": self.detector.last_run, "detection_error": self.detector.last_error}
         if op == "scan_connections":
             return await asyncio.to_thread(self.scanner.scan_connections, int(p.get("minutes", 10)))
         if op == "scan_dns":
             return await asyncio.to_thread(self.scanner.scan_dns, int(p.get("minutes", 10)))
         if op == "scan_processes":
             return await asyncio.to_thread(self.scanner.scan_processes)
+        if op == "list_alerts":
+            alerts = self.db.list_alerts(int(p.get("since_id") or 0), max(1, min(int(p.get("limit", 20)), 200)))
+            for a in alerts:  # current status of the actions created for each alert
+                a["actions"] = [summarize(x) for x in (self.db.get_action(i) for i in a["action_ids"]) if x]
+                a["detail"].pop("actions", None)
+            return alerts
         if op == "scan_files":
             return await asyncio.to_thread(self.scanner.scan_files, str(p.get("path") or ""))
         if op == "scan_auth_logs":
@@ -281,6 +291,9 @@ class HostAgent:
                     self.config.agent_addr, self.config.admin_addr, self.config.dry_run,
                     len(self.allowlist.entries))
         self._collectors = [asyncio.create_task(self.sampler.run()), asyncio.create_task(self.dns.run())]
+        if self.config.auto_detect:
+            self._collectors.append(asyncio.create_task(self.detector.run()))
+            logger.info("always-on detection every %ds", self.config.detect_interval)
         async with agent_srv, admin_srv:
             while True:
                 try:

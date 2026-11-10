@@ -7,6 +7,7 @@ start: backends run with a recording runner or against temp files.
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import subprocess
 import sys
@@ -537,3 +538,46 @@ def test_duplicate_request_reuses_the_pending_action(agent):
     call(agent, "admin", "reject", id=a1["id"], actor="alice")
     a3 = call(agent, "agent", "create_action", type="block_ip", params={"ip": "45.1.2.3"}, reason="again")["data"]
     assert a3["id"] != a1["id"] and not a3.get("duplicate")  # a rejected action does not block a new request
+
+
+# --- always-on detection (AlertEngine) ----------------------------------------------
+
+
+class FakeScanner:
+    def __init__(self, report):
+        self.report = report
+
+    def scan_host(self, minutes=60):
+        return self.report
+
+
+def test_alert_engine_creates_alert_and_pending_actions_once(agent, backend):
+    from mcp_threatintel.responder.alerts import AlertEngine
+
+    report = {"connections": {"malicious": [{"remote_ip": "45.1.2.3", "remote_port": 443, "pid": None,
+                                              "process": "curl", "active": False, "ioc_matches": [{"source": "feodo"}]}]},
+              "dns": {"malicious": [{"domain": "evil.example", "lookups": 2, "ioc_matches": [{"source": "otx"}]}]}}
+    eng = AlertEngine(agent.db, agent.manager, FakeScanner(report))
+    first = eng.tick()
+    assert len(first) == 2 and eng.tick() == []                     # second scan: nothing new
+    alerts = call(agent, "agent", "list_alerts")["data"]
+    assert {a["kind"] for a in alerts} == {"c2_connection", "malicious_dns"}
+    pend = {(a["type"], a["target"]) for a in agent.db.list_actions("pending")}
+    assert pend == {("block_ip", "45.1.2.3"), ("sinkhole_domain", "evil.example")}
+    assert all(a["requested_by"] == "auto-detect" for a in agent.db.list_actions("pending"))
+    assert all(x["status"] == "pending" for a in alerts for x in a["actions"])
+    asyncio.run(agent.process_approved())
+    assert backend.applied == []                                     # never executed without approval
+    assert call(agent, "admin", "list_alerts")["ok"] is True
+
+
+def test_alert_engine_records_refused_actions(agent):
+    from mcp_threatintel.responder.alerts import AlertEngine
+
+    report = {"auth_logs": {"details": [{"ip": "8.8.8.8", "failures": 50, "accepted": 0, "users_tried": ["root"],
+                                         "brute_force": True, "known_malicious": False, "ioc_matches": []}]}}
+    eng = AlertEngine(agent.db, agent.manager, FakeScanner(report))
+    assert len(eng.tick()) == 1
+    alert = agent.db.list_alerts()[0]
+    assert alert["action_ids"] == [] or agent.db.get_action(alert["action_ids"][0])["status"] == "rejected"
+    assert "allowlisted" in json.dumps(alert["detail"]) or alert["action_ids"]

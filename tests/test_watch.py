@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import httpx
 
-from mcp_threatintel.watch.findings import SeenStore, extract_findings
+from mcp_threatintel.responder.findings import SeenStore, extract_findings
 from mcp_threatintel.watch.llm import investigate
 from mcp_threatintel.watch.notify import toast_xml
 from mcp_threatintel.watch.watcher import approve_hint
@@ -99,3 +99,33 @@ def test_investigation_tool_loop():
     assert [c[0] for c in mcp.calls] == ["lookup_ioc", "block_ip"]        # "approve" never reached the server
     offered = {t["function"]["name"] for t in sent[0]["tools"]}
     assert offered == {"lookup_ioc", "block_ip"}                          # scan/feed tools not offered
+
+
+class AlertsMCP:
+    def __init__(self, alerts):
+        self.alerts = alerts
+
+    async def call_tool(self, name, args):
+        since = args.get("since_id") or 0
+        data = [a for a in self.alerts if a["id"] > since]
+        return SimpleNamespace(content=[SimpleNamespace(text=json.dumps(data))])
+
+
+def test_notifier_first_run_summarises_then_shows_only_new(tmp_path, monkeypatch):
+    from mcp_threatintel.watch import watcher
+
+    shown = []
+    monkeypatch.setattr(watcher, "notify", lambda title, lines: shown.append(title) or True)
+
+    async def fake_show(mcp, alert, args, toast):
+        shown.append(f"alert {alert['id']}")
+
+    monkeypatch.setattr(watcher, "show", fake_show)
+    alerts = [{"id": i, "severity": "high", "title": f"t{i}", "actions": []} for i in (1, 2)]
+    last = watcher.LastSeen(tmp_path / "last.txt")
+    mcp = AlertsMCP(alerts)
+    asyncio.run(watcher.poll(mcp, last, SimpleNamespace(no_ai=True)))
+    assert shown == ["ThreatIntel - 2 alert(s) on the server"] and last.get() == 2   # no replay of old alerts
+    alerts.append({"id": 3, "severity": "critical", "title": "t3", "actions": []})
+    asyncio.run(watcher.poll(mcp, last, SimpleNamespace(no_ai=True)))
+    assert shown[-1] == "alert 3" and last.get() == 3
