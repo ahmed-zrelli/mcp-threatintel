@@ -71,20 +71,33 @@ class OtxClient(BaseClient):
             "references_list": json.dumps(p.get("references", [])),
             "adversary": p.get("adversary", ""),
             "targeted_countries": json.dumps(p.get("targeted_countries", [])),
-            "malware_families": json.dumps(p.get("malware_families", [])),
-            "attack_ids": json.dumps([a.get("id", "") for a in p.get("attack_ids", [])]),
+            "malware_families": json.dumps(_ids(p.get("malware_families"), key="display_name")),
+            "attack_ids": json.dumps(_ids(p.get("attack_ids"))),
             "raw_json": json.dumps(p),
         }
 
     def shape_indicators(self, pulse_id: str, indicators: list[dict]) -> list[tuple]:
         """Extract indicators from a pulse."""
         results = []
-        for ind in indicators:
+        for ind in indicators or []:
+            if not isinstance(ind, dict):
+                continue
             ioc = ind.get("indicator")
             ioc_type = _otx_type(ind.get("type", ""))
             if ioc and ioc_type:
                 results.append((pulse_id, ioc, ioc_type))
         return results
+
+
+def _ids(values, key: str = "id") -> list[str]:
+    """OTX sends some lists either as strings ("T1059") or as objects ({"id": "T1059", ...})."""
+    out = []
+    for v in values or []:
+        if isinstance(v, dict):
+            v = v.get(key) or v.get("id") or v.get("name") or ""
+        if v:
+            out.append(str(v))
+    return out
 
 
 def _otx_type(otx_type: str) -> str:

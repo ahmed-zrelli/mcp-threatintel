@@ -159,19 +159,23 @@ async def poll_otx(conn):
             modified_since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
         pulses = await client.get_subscribed_pulses(modified_since=modified_since)
-        added = 0
+        added = skipped = 0
         for p in pulses:
-            shaped = client.shape_pulse(p)
-            upsert_pulse(conn, shaped)
-            # Extract and store indicators
-            indicators = p.get("indicators", [])
-            for pulse_id, indicator, ioc_type in client.shape_indicators(p["id"], indicators):
-                upsert_pulse_indicator(conn, pulse_id, indicator, ioc_type)
-            added += 1
+            try:
+                shaped = client.shape_pulse(p)
+                upsert_pulse(conn, shaped)
+                # Extract and store indicators
+                indicators = p.get("indicators", [])
+                for pulse_id, indicator, ioc_type in client.shape_indicators(p["id"], indicators):
+                    upsert_pulse_indicator(conn, pulse_id, indicator, ioc_type)
+                added += 1
+            except Exception as e:  # one malformed pulse must not drop the whole feed
+                skipped += 1
+                logger.warning("otx: skipped pulse %s: %s", p.get("id") if isinstance(p, dict) else "?", e)
         conn.commit()
         indicators = conn.execute("SELECT COUNT(*) FROM pulse_indicators").fetchone()[0]
         update_feed_sync(conn, "otx", added, total=indicators)
-        logger.info("otx: upserted %d pulses (%d indicators stored)", added, indicators)
+        logger.info("otx: upserted %d pulses (%d indicators stored, %d skipped)", added, indicators, skipped)
         await client.close()
     except Exception as e:
         logger.error("otx poll failed: %s", e)

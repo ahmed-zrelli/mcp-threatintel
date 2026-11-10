@@ -50,3 +50,18 @@ async def test_cisa_shapes_kev_catalog(monkeypatch):
     assert row["description"] == "Remote code execution."
     assert row["known_ransomware"] == "Known"
     assert "raw_json" in row
+
+
+def test_otx_shape_pulse_accepts_strings_and_objects():
+    import json
+
+    from mcp_threatintel.clients.otx import OtxClient
+
+    c = OtxClient.__new__(OtxClient)
+    as_strings = c.shape_pulse({"id": "1", "name": "n", "attack_ids": ["T1562.001", "T1555"], "malware_families": ["XMRig"]})
+    as_objects = c.shape_pulse({"id": "2", "name": "n", "attack_ids": [{"id": "T1059", "name": "x"}],
+                                "malware_families": [{"id": "m", "display_name": "Emotet"}]})
+    assert json.loads(as_strings["attack_ids"]) == ["T1562.001", "T1555"]
+    assert json.loads(as_objects["attack_ids"]) == ["T1059"]
+    assert json.loads(as_objects["malware_families"]) == ["Emotet"]
+    assert c.shape_indicators("1", ["junk", {"indicator": "evil.example", "type": "domain"}]) == [("1", "evil.example", "domain")]
