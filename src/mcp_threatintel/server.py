@@ -440,6 +440,20 @@ async def related_iocs(indicator: str) -> str:
     return await _agent_call("related_iocs", indicator=indicator)
 
 
+@mcp.tool(annotations=ACTION)
+async def resolve_alert(alert_id: int, decision: str, justification: str) -> str:
+    """Resolve an alert after investigating it. decision: execute (run the alert's actions),
+    dismiss (false positive) or escalate (a human decides). Only works when the server's autonomous
+    mode is ON, only for the alert's own reversible actions; otherwise it is stored as a recommendation.
+
+    Args:
+        alert_id: The investigated alert.
+        decision: execute, dismiss or escalate.
+        justification: Why, based on the evidence (one or two sentences).
+    """
+    return await _agent_call("resolve_alert", alert_id=alert_id, decision=decision, justification=justification)
+
+
 @mcp.tool(annotations=GOVERN)
 async def save_alert_report(alert_id: int, report: str) -> str:
     """Store the investigation report of an alert on the server (text only, changes nothing on the host).

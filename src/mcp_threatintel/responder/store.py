@@ -96,7 +96,9 @@ class ResponderDB:
     def _migrate(self) -> None:
         """Columns added after the first release (existing databases on deployed servers)."""
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(alerts)")}
-        for col, ddl in (("report", "TEXT"), ("report_by", "TEXT"), ("report_at", "TEXT")):
+        for col, ddl in (("report", "TEXT"), ("report_by", "TEXT"), ("report_at", "TEXT"),
+                         ("resolution", "TEXT"), ("resolution_by", "TEXT"), ("resolution_at", "TEXT"),
+                         ("resolution_note", "TEXT")):
             if col not in cols:
                 self._conn.execute(f"ALTER TABLE alerts ADD COLUMN {col} {ddl}")
         self._conn.commit()
@@ -216,6 +218,19 @@ class ResponderDB:
             self._conn.execute("UPDATE alerts SET report = ?, report_by = ?, report_at = ? WHERE id = ?",
                                (report[:8000], by, now_iso(), alert_id))
             self._conn.commit()
+
+    def save_resolution(self, alert_id: int, resolution: str, by: str, note: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE alerts SET resolution = ?, resolution_by = ?, resolution_at = ?, resolution_note = ? "
+                "WHERE id = ?", (resolution, by, now_iso(), note[:2000], alert_id))
+            self._conn.commit()
+
+    def count_audit_since(self, actor: str, event: str, since_iso: str) -> int:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) FROM audit_log WHERE actor = ? AND event = ? AND ts >= ?",
+                (actor, event, since_iso)).fetchone()[0]
 
     def alerted_since(self, key: str, since_iso: str) -> bool:
         with self._lock:

@@ -24,7 +24,7 @@ LOCAL = {
 REMOTE = {"check_password_breach", "get_latest_breach"}
 HOST = {"scan_network_connections", "scan_files", "check_auth_logs", "scan_host", "list_alerts",
         "investigate_host", "related_iocs"}
-ACTIONS = {"block_ip", "sinkhole_domain", "quarantine_file", "kill_process", "block_feed_c2"}
+ACTIONS = {"block_ip", "sinkhole_domain", "quarantine_file", "kill_process", "block_feed_c2", "resolve_alert"}
 GOVERNANCE = {"list_actions", "get_action_status", "rollback_action", "save_alert_report"}
 
 
@@ -34,9 +34,9 @@ def tools():
     return {t.name: t for t in asyncio.run(server.mcp.list_tools())}
 
 
-def test_the_expected_twenty_four_are_present(tools):
+def test_the_expected_twenty_five_are_present(tools):
     assert set(tools) == LOCAL | REMOTE | HOST | ACTIONS | GOVERNANCE
-    assert len(tools) == 24
+    assert len(tools) == 25
 
 
 def test_every_tool_is_annotated(tools):

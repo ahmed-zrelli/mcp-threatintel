@@ -68,6 +68,10 @@ class ResponderConfig:
     # Always-on detection inside the agent (AlertEngine)
     auto_detect: bool = True
     detect_interval: int = 30
+    # Autonomous mode: the model may resolve alerts itself (off = human approval only)
+    autonomy: bool = False
+    autonomy_actions: tuple = ("block_ip", "sinkhole_domain", "quarantine_file")
+    autonomy_max_per_hour: int = 20
 
     @property
     def ttl_seconds_per_unit(self) -> int:
@@ -101,4 +105,8 @@ class ResponderConfig:
             nft_ruleset_file=Path(os.environ["NFT_RULESET_FILE"]) if os.getenv("NFT_RULESET_FILE") else None,
             auto_detect=_bool("AUTO_DETECT", True),
             detect_interval=max(10, int(os.getenv("AUTO_DETECT_INTERVAL", "30"))),
+            autonomy=os.getenv("AUTONOMY", "off").strip().lower() in {"1", "on", "true", "yes"},
+            autonomy_actions=tuple(a.strip() for a in os.getenv(
+                "AUTONOMY_ACTIONS", "block_ip,sinkhole_domain,quarantine_file").split(",") if a.strip()),
+            autonomy_max_per_hour=int(os.getenv("AUTONOMY_MAX_PER_HOUR", "20")),
         )

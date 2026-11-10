@@ -116,6 +116,7 @@ async def show(mcp, alert: dict, args, toast: bool) -> None:
         report, by = basic_report(full, actions), "auto"
     else:
         brief = {"alert": {k: full.get(k) for k in ("id", "ts", "kind", "severity", "title")},
+                 "autonomous_mode": full.get("autonomy"),
                  "detail": {k: v for k, v in (full.get("detail") or {}).items() if k != "evidence"},
                  "actions_already_created": [{k: a.get(k) for k in ("id", "type", "target", "status")}
                                              for a in actions],
@@ -139,6 +140,20 @@ async def show(mcp, alert: dict, args, toast: bool) -> None:
     except Exception as e:
         out(f"    could not save the report on the server ({e})")
     out(f"    REPORT ({by}):\n      " + report.replace("\n", "\n      "))
+    after = _text(await mcp.call_tool("list_alerts", {"alert_id": alert["id"]}))
+    if isinstance(after, dict) and after.get("resolution"):
+        res, acts = after["resolution"], after.get("actions") or []
+        done = [a for a in acts if a.get("status") in ("approved", "executed")]
+        still = [a for a in acts if a.get("status") == "pending"]
+        out(f"    RESOLUTION by {after.get('resolution_by')}: {res} - {after.get('resolution_note')}")
+        if toast and not res.startswith("recommended_"):
+            title = {"executed": "Qwen resolved", "partially_executed": "Qwen partly resolved",
+                     "dismissed": "Qwen dismissed", "escalated": "Qwen escalated to you"}.get(res, res)
+            lines = [", ".join(f"{a['type']} {str(a['target'])[:30]}" for a in done)
+                     or (after.get("resolution_note") or "")[:150]]
+            lines.append(approve_hint(still) if still else "Undo anytime: ask Qwen to roll back the action.")
+            notify(f"ThreatIntel - {title} alert #{alert['id']}", lines)
+            return
     if toast:
         summary = next((line.split(":", 1)[1].strip() for line in report.splitlines()
                         if line.upper().startswith("SUMMARY")), report[:180])

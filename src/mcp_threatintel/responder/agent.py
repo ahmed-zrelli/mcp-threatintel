@@ -28,6 +28,7 @@ from .backends.nftables import NftablesBackend
 from .config import ResponderConfig
 from .iocs import IocIndex
 from .alerts import AlertEngine
+from .autonomy import Autonomy
 from .monitor import ConnectionSampler, DnsMonitor
 from .protocol import serve
 from .scanner import HostScanner
@@ -38,7 +39,7 @@ logger = logging.getLogger("threatintel.responder")
 
 AGENT_OPS = {
     "ping", "scan_connections", "scan_files", "scan_auth_logs", "scan_host", "scan_dns", "scan_processes", "list_alerts",
-    "investigate_host", "related_iocs", "save_alert_report",
+    "investigate_host", "related_iocs", "save_alert_report", "resolve_alert",
     "create_action", "get_action", "list_actions", "request_rollback",
 }
 ADMIN_OPS = {"ping", "list_actions", "get_action", "approve", "reject", "audit", "list_alerts"}
@@ -83,6 +84,7 @@ class HostAgent:
         self.scanner = HostScanner(config, self.iocs, self.sampler, self.dns)
         self.manager = ActionManager(self.db, self.allowlist, self.iocs, config)
         self.detector = AlertEngine(self.db, self.manager, self.scanner, interval_s=config.detect_interval)
+        self.autonomy = Autonomy(self.db, self.manager, config)
         # One backend set per mode, chosen by each action's own dry_run flag, so an
         # action executed for real is also rolled back for real (and vice versa).
         self.backends = backends or {
@@ -126,7 +128,8 @@ class HostAgent:
                     "platform": sys.platform, "allowlist_entries": len(self.allowlist.entries),
                     "dns_monitor": self.dns.status, "indicators_indexed": self.iocs.counts,
                     "auto_detect": self.config.auto_detect, "detect_interval_s": self.config.detect_interval,
-                    "last_detection_run": self.detector.last_run, "detection_error": self.detector.last_error}
+                    "last_detection_run": self.detector.last_run, "detection_error": self.detector.last_error,
+                    "autonomy": self.autonomy.status()}
         if op == "scan_connections":
             return await asyncio.to_thread(self.scanner.scan_connections, int(p.get("minutes", 10)))
         if op == "scan_dns":
@@ -140,6 +143,7 @@ class HostAgent:
                     raise TransitionError(f"no alert with id {p['alert_id']}")
                 alert["actions"] = [summarize(x) for x in (self.db.get_action(i) for i in alert["action_ids"]) if x]
                 alert["detail"].pop("actions", None)
+                alert["autonomy"] = self.autonomy.status()
                 return alert
             alerts = self.db.list_alerts(int(p.get("since_id") or 0), max(1, min(int(p.get("limit", 20)), 200)))
             for a in alerts:  # current status of the actions; evidence only via alert_id (keeps lists small)
@@ -159,6 +163,11 @@ class HostAgent:
             return await asyncio.to_thread(fn, value)
         if op == "related_iocs":
             return await asyncio.to_thread(self.detector.forensics.related_iocs, str(p.get("indicator") or ""))
+        if op == "resolve_alert":
+            result = await asyncio.to_thread(self.autonomy.resolve, int(p.get("alert_id") or 0),
+                                             str(p.get("decision") or ""), str(p.get("justification") or ""))
+            self._wake.set()
+            return result
         if op == "save_alert_report":
             alert_id, report = int(p.get("alert_id") or 0), str(p.get("report") or "").strip()
             if not self.db.get_alert(alert_id) or not report:
