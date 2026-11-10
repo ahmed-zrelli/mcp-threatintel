@@ -53,6 +53,7 @@ class IocIndex:
         self.refresh_s = refresh_s
         self._lock = threading.Lock()
         self._built_at = 0.0
+        self._checked_at = 0.0
         self._mtime = None
         self._idx: dict[str, dict[str, list[dict]]] = {"ip": {}, "domain": {}, "url": {}, "hash": {}}
         self.counts: dict[str, int] = {}
@@ -78,12 +79,14 @@ class IocIndex:
             return None
 
     def _ensure(self) -> None:
+        """Rebuild when the database changed (checked at most every few seconds, a cheap stat),
+        so new feed or lab indicators are used almost at once."""
         now = time.time()
-        if self._built_at and now - self._built_at < self.refresh_s:
+        if self._built_at and now - self._checked_at < min(self.refresh_s, 5):
             return
+        self._checked_at = now
         mtime = self._db_mtime()
         if self._built_at and mtime == self._mtime:
-            self._built_at = now
             return
         with self._lock:
             self._idx = self._build()

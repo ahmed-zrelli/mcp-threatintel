@@ -8,3 +8,5 @@ value,type,comment
 9.9.9.9,ip,Scenario A - simulated C2 server (change it if Quad9 is your DNS)
 f8994855ae7bd42bf3490f416413850bc6d385a6af8f50e2685d2514b2e46f48,hash_sha256,Scenario B - lab test file (lab/create_test_files.py)
 c2.threatintel-lab.test,domain,Scenario C - simulated C2 domain
+beacon.threatintel-lab.test,domain,Event test - second simulated C2 domain
+update.threatintel-lab.test,domain,Event test - third simulated C2 domain

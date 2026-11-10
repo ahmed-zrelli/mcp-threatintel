@@ -47,7 +47,7 @@ def openai_tools(mcp_tools) -> list[dict]:
         {"type": "function", "function": {
             "name": t.name,
             "description": (t.description or "")[:400],
-            "parameters": t.inputSchema or {"type": "object", "properties": {}},
+            "parameters": getattr(t, "input_schema", None) or getattr(t, "inputSchema", None) or {"type": "object", "properties": {}},
         }}
         for t in mcp_tools if t.name in INVESTIGATION_TOOLS
     ]
