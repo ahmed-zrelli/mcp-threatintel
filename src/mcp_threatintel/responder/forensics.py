@@ -265,6 +265,7 @@ def _sniff(head: bytes) -> str:
 
 _SUDO = re.compile(r"sudo\[\d+\]:\s+(\S+) : (?:.*?TTY=(\S+) ; )?.*?USER=(\S+) ; COMMAND=(.+)$")
 _FROM_TTY = re.compile(r"from=/dev/(\S+)")
+_PROG = re.compile(r"\s([\w.-]+)\[\d+\]:")
 _ADMIN_TOOLS = ("sudo", "su", "useradd", "usermod", "userdel", "groupadd", "groupmod", "gpasswd", "passwd",
                 "chpasswd", "chsh", "adduser", "deluser")
 
@@ -300,12 +301,16 @@ def change_origin(terms: list[str], *, allowlist=None, admins: tuple = (), minut
         m = _SUDO.search(ln)
         if m:
             user, tty, as_user, cmd = m.group(1), (m.group(2) or "").replace("/dev/", ""), m.group(3), m.group(4)
+            if not any(t in cmd for t in terms):
+                continue   # a sudo command about something else
             entry = {"user": user, "via": f"sudo (as {as_user})", "tty": tty or None, "command": cmd[:200]}
         else:
             t = _FROM_TTY.search(ln)
             if not t:
                 continue
-            entry = {"user": None, "via": ln.split(":", 1)[0].split()[-1].split("[")[0], "tty": t.group(1)}
+            prog = _PROG.search(ln)
+            entry = {"user": None, "via": f"{prog.group(1) if prog else 'admin tool'} run directly as root (no sudo trace)",
+                     "tty": t.group(1)}
         ip = tty_ip.get((entry["user"] or "*", entry["tty"] or "")) or tty_ip.get(("*", entry["tty"] or ""))
         entry["from_ip"] = None if ip in (None, "0.0.0.0", ":0") else ip
         if entry["from_ip"] and allowlist is not None:
@@ -355,7 +360,7 @@ def collect_evidence(fx: Forensics, kind: str, detail: dict) -> dict:
     elif kind.startswith(("account_", "integrity_")):
         # Who did it, from where: the deciding fact for a change an admin could also have made.
         term = detail.get("user") or detail.get("path")
-        safe("change_origin", fx.change_origin, [term, detail.get("group")] if term else [])
+        safe("change_origin", fx.change_origin, [term] if term else [])
     elif kind in ("new_listener", "suspicious_process", "reverse_shell"):
         if detail.get("pid"):
             safe("process", fx.inspect_process, detail["pid"])

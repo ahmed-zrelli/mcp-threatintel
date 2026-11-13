@@ -193,7 +193,11 @@ JOURNAL = """2026-11-13T08:48:31+00:00 devsecops sudo[2128]:    ahmed : TTY=pts/
 2026-11-13T08:48:31+00:00 devsecops useradd[2130]: new user: name=labuser3, UID=1001, GID=1001, home=/home/labuser3, shell=/bin/bash, from=/dev/pts/1
 2026-11-13T08:48:40+00:00 devsecops sudo[2138]:    ahmed : TTY=pts/0 ; PWD=/home/ahmed ; USER=root ; COMMAND=/usr/sbin/usermod -aG sudo labuser3
 2026-11-13T08:48:40+00:00 devsecops usermod[2140]: add 'labuser3' to group 'sudo'
-2026-11-13T08:49:00+00:00 devsecops sudo[2150]:    bob : TTY=pts/3 ; PWD=/tmp ; USER=root ; COMMAND=/usr/sbin/useradd backdoor"""
+2026-11-13T08:49:00+00:00 devsecops sudo[2150]:    bob : TTY=pts/3 ; PWD=/tmp ; USER=root ; COMMAND=/usr/sbin/useradd backdoor
+2026-11-13T09:11:42+00:00 devsecops sudo[2728]:    ahmed : TTY=pts/0 ; PWD=/home/ahmed ; USER=root ; COMMAND=/usr/bin/systemctl restart sudo-unrelated
+2026-11-13T09:12:01+00:00 devsecops sudo[2752]:    ahmed : TTY=pts/0 ; PWD=/root ; USER=root ; COMMAND=/bin/bash
+2026-11-13T09:12:07+00:00 devsecops useradd[2824]: new user: name=rootkit, UID=1002, GID=1002, home=/home/rootkit, shell=/bin/bash, from=/dev/pts/0
+2026-11-13T09:12:13+00:00 devsecops usermod[2836]: add 'rootkit' to group 'sudo'"""
 LAST = """ahmed    pts/1        192.168.21.1     Fri Nov 13 08:40   still logged in
 ahmed    pts/0        192.168.21.1     Fri Nov 13 08:30   still logged in
 bob      pts/3        203.0.113.9      Fri Nov 13 08:45   still logged in"""
@@ -210,5 +214,9 @@ def test_change_origin_says_who_made_an_account_change():
     bad = change_origin(["backdoor"], allowlist=allow, admins=("root", "ahmed"), journal=JOURNAL, logins=LAST)
     (m,) = bad["made_by"]
     assert m["user"] == "bob" and not m["known_admin"] and m["from_ip"] == "203.0.113.9" and not m["from_allowlisted"]
+    # created from a root shell: no sudo command names the account -> no known admin; unrelated sudo lines ignored
+    root = change_origin(["rootkit"], allowlist=allow, admins=("root", "ahmed"), journal=JOURNAL, logins=LAST)
+    (r,) = root["made_by"]
+    assert r["user"] is None and not r["known_admin"] and r["via"].startswith("useradd run directly as root")
     none = change_origin(["ghost"], journal=JOURNAL, logins=LAST)
     assert none["made_by"] == [] and "no record" in none["note"]
