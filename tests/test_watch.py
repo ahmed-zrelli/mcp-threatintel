@@ -58,9 +58,10 @@ def test_toast_text_is_escaped():
 
 
 def test_approve_hint_lists_pending_only():
-    hint = approve_hint([{"id": 3, "status": "pending"}, {"id": 4, "status": "rejected"}, {"id": 5, "status": "pending"}])
-    assert hint == "Approve on the server: threatintel-approve approve 3 ; threatintel-approve approve 5"
-    assert approve_hint([{"status": "rejected"}]) == "No action to approve."
+    hint = approve_hint([{"id": 3, "type": "block_ip", "status": "executed"}, {"id": 4, "status": "rejected"},
+                         {"id": 5, "type": "kill_process", "status": "pending"}])
+    assert hint == "Executed: #3 block_ip | Waiting for the AI: #5 kill_process"
+    assert approve_hint([{"status": "rejected"}]) == "No action."
 
 
 class FakeMCP:
@@ -122,18 +123,17 @@ def test_notifier_first_run_summarises_then_shows_only_new(tmp_path, monkeypatch
 
     monkeypatch.setattr(watcher, "announce", lambda alert, toast: shown.append(f"alert {alert['id']}"))
     monkeypatch.setattr(watcher, "investigate_alert", fake_investigate)
-    alerts = [{"id": i, "severity": "high", "title": f"t{i}", "actions": []} for i in (1, 2)]
+    alerts = [{"id": i, "severity": "high", "title": f"t{i}", "actions": [], "detail": {"route": "ai"}} for i in (1, 2)]
     last = watcher.LastSeen(tmp_path / "last.txt")
     mcp = AlertsMCP(alerts)
     asyncio.run(watcher.poll(mcp, last, SimpleNamespace(no_ai=True)))
     assert shown == ["ThreatIntel - 2 alert(s) on the server"] and last.get() == 2   # no replay of old alerts
-    alerts.append({"id": 3, "severity": "critical", "title": "t3", "actions": []})
+    alerts.append({"id": 3, "severity": "critical", "title": "t3", "actions": [], "detail": {"route": "ai"}})
     asyncio.run(watcher.poll(mcp, last, SimpleNamespace(no_ai=True)))
     assert shown[-2:] == ["alert 3", "investigated 3"] and last.get() == 3
-    jobs = asyncio.Queue()                                     # background mode: announced now, queued
-    alerts.append({"id": 4, "severity": "high", "title": "t4", "actions": []})
-    asyncio.run(watcher.poll(mcp, last, SimpleNamespace(no_ai=True), jobs))
-    assert shown[-1] == "alert 4" and jobs.qsize() == 1
+    alerts.append({"id": 4, "severity": "high", "title": "t4", "actions": [], "detail": {"route": "rules"}})
+    asyncio.run(watcher.poll(mcp, last, SimpleNamespace(no_ai=True)))
+    assert shown[-1] == "alert 4"                               # handled by the rules: no AI
 
 
 def test_one_notification_per_attack(monkeypatch):

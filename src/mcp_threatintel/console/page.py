@@ -151,12 +151,18 @@ function renderIncidents(list) {
     el("td", {class: "muted"}, t(i.last_seen))))));
 }
 function renderAlerts(list) {
-  $("alerts").replaceChildren(table(["#", "Time", "Severity", "Alert", "Incident", "Actions", "AI"], list.map(a => el("tr", {class: "row", onclick: () => openAlert(a.id)},
+  $("alerts").replaceChildren(table(["#", "Time", "Severity", "Alert", "Incident", "Actions", "Handled by"], list.map(a => el("tr", {class: "row", onclick: () => openAlert(a.id)},
     el("td", {}, a.id), el("td", {class: "muted"}, t(a.ts)), el("td", {}, sev(a.severity)),
     el("td", {class: "wrap"}, a.title, a.occurrences > 1 ? el("span", {class: "muted"}, ` (seen ${a.occurrences}x)`) : null),
     el("td", {}, a.incident_id ? `#${a.incident_id} ${a.incident_event || ""}` : "-"),
     el("td", {class: "muted"}, (a.actions || []).map(x => `#${x.id} ${x.type} ${x.status}`).join(", ") || "-"),
-    el("td", {class: "muted"}, a.report ? "report" : (a.resolution || "-"))))));
+    el("td", {class: "muted"}, handledBy(a))))));
+}
+function handledBy(a) {
+  const route = (a.detail || {}).route;
+  if (route === "rules") return "rules";
+  if (route === "ai") return a.resolution ? `AI: ${a.resolution}` : "AI: queued";
+  return a.resolution || "-";
 }
 function renderScans(list) {
   $("scans").replaceChildren(table(["Time", "Source", "Ports", "Note"], list.slice().reverse().map(s => el("tr", {},

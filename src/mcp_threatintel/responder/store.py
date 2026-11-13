@@ -361,6 +361,22 @@ class ResponderDB:
             out.append(d)
         return out
 
+    def set_alert_route(self, alert_id: int, route: str) -> None:
+        alert = self.get_alert(alert_id)
+        if not alert:
+            return
+        detail = {**alert["detail"], "route": route}
+        with self._lock:
+            self._conn.execute("UPDATE alerts SET detail_json = ? WHERE id = ?",
+                               (json.dumps(detail, default=str), alert_id))
+            self._conn.commit()
+
+    def alerts_with_action(self, action_id: int) -> list[int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT a.id FROM alerts a, json_each(a.action_ids) j WHERE j.value = ?", (action_id,)).fetchall()
+        return [r["id"] for r in rows]
+
     # --- reporting (time ranges) ---
 
     def alerts_since(self, since_iso: str, limit: int = 500) -> list[dict]:

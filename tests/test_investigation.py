@@ -107,20 +107,6 @@ def test_alert_reports_and_migration(tmp_path):
     db.close()
 
 
-def test_basic_report_without_model():
-    from mcp_threatintel.watch.watcher import basic_report
-
-    alert = {"id": 3, "ts": "2026-11-10T19:00:00+00:00", "title": "C2 connection", "severity": "critical",
-             "detail": {"ioc": "feodo qakbot", "evidence": {
-                 "process": {"pid": 42, "name": "curl", "user": "www-data", "started": "x",
-                             "parent_chain": [{"pid": 1, "name": "bash"}]},
-                 "campaign": {"pulses": [{"name": "Operation Lab"}], "malware_families": ["qakbot"],
-                              "related_present_on_host": [{"value": "bad-c2.example"}]}}}}
-    rep = basic_report(alert, [{"id": 9, "status": "pending"}])
-    assert rep.startswith("SUMMARY: C2 connection") and "curl PID 42" in rep and "bad-c2.example" in rep
-    assert "threatintel-approve approve 9" in rep
-
-
 def test_agent_investigation_ops(agent):  # noqa: F811
     from mcp_threatintel.responder.alerts import AlertEngine
 

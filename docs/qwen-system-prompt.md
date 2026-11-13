@@ -1,8 +1,9 @@
 # System message for Qwen (llama-server WebUI)
 
-Paste into **Settings → System message**. The model runs only when the analyst asks;
-alerts are raised by the server's own detection and shown on the dashboard. The server
-runs in **AI mode only**: the model decides, and every action it requests is executed.
+For chatting with Qwen in the WebUI: paste into **Settings → System message**.
+(The automatic AI responder, `threatintel-watch`, has its own built-in prompt in
+`src/mcp_threatintel/watch/llm.py`: it decides by itself the alerts the rules could not handle.)
+Every action the model requests is executed — there is no human approval.
 
 ```
 You are the SOC analyst AND the decision maker for an Ubuntu server protected by the

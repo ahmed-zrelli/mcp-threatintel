@@ -1,12 +1,13 @@
 # Start the analyst console on this PC (split architecture): MCP server for Qwen,
-# feed poller (pushes intel to the agent) and the dashboard, each in its own window.
+# feed poller (pushes intel to the agent), the dashboard and the AI responder (decides the
+# alerts the rules cannot handle), each in its own window. -LlmContext = llama-server -c.
 # Nothing is installed or scheduled: close the windows to stop everything.
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\windows\start-console.ps1
 #
 # Needs the console bundle copied from the server into .\console\
 #   scp -i <key> <user>@<server>:/etc/threatintel/console/* console\
-param([switch]$NoPoller, [switch]$DashboardOnly)
+param([switch]$NoPoller, [switch]$DashboardOnly, [switch]$NoAI, [int]$LlmContext = 8192)
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $bundle = Join-Path $root "console"
@@ -34,6 +35,10 @@ Write-Host "Agent: $env:AGENT_ADDR (admin $env:ADMIN_ADDR)"
 if (-not $DashboardOnly) { Start-Window "MCP server (Qwen tools)" "mcp-threatintel.exe" "" }
 if (-not $NoPoller -and -not $DashboardOnly) { Start-Window "Feed poller (pushes intel to the agent)" "mcp-threatintel-poller.exe" "--loop" }
 Start-Window "Dashboard" "threatintel-console.exe" ""
+if (-not $DashboardOnly -and -not $NoAI) {
+    # AI responder: decides the alerts the rules cannot handle (needs llama-server; waits for it otherwise)
+    Start-Window "AI responder (Qwen)" "threatintel-watch.exe" "--llm-context $LlmContext"
+}
 Start-Sleep -Seconds 3
 Start-Process "http://127.0.0.1:3720"
 Write-Host "Started. Dashboard: http://127.0.0.1:3720   MCP for the WebUI: http://127.0.0.1:3707/mcp"

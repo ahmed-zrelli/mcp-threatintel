@@ -75,6 +75,10 @@ class ResponderConfig:
     autonomy_actions: tuple = ("block_ip", "sinkhole_domain", "quarantine_file", "kill_process", "lock_user",
                                "block_feed_c2")
     autonomy_max_per_hour: int = 20
+    # Rules act first: high-confidence detections execute their actions at once (actor "rules");
+    # what the rules cannot handle is routed to the AI. from_env turns it on (RULES_EXECUTE, default true);
+    # the dataclass default only serves unit tests of the approval flow.
+    rules_execute: bool = False
     # Accounts lock_user must never touch (the analyst's own admin account belongs here)
     protected_users: tuple = ("root",)
     # Network channels (tls:// addresses): the agent's certificate, and who may connect
@@ -121,6 +125,7 @@ class ResponderConfig:
             autonomy_max_per_hour=int(os.getenv("AUTONOMY_MAX_PER_HOUR", "20")),
             protected_users=tuple(dict.fromkeys(["root"] + [u.strip() for u in os.getenv(
                 "PROTECTED_USERS", "").split(",") if u.strip()])),
+            rules_execute=_bool("RULES_EXECUTE", True),
             tls_cert=os.getenv("TLS_CERT") or None,
             tls_key=os.getenv("TLS_KEY") or None,
             allowed_clients=tuple(a.strip() for a in os.getenv("ALLOWED_CLIENTS", "").split(",") if a.strip()),

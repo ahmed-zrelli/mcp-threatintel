@@ -408,7 +408,8 @@ async def scan_host(minutes: int = 60) -> str:
 
 
 @mcp.tool(annotations=HOST_READ)
-async def list_alerts(since_id: int = 0, limit: int = 10, alert_id: int = 0, wait_s: float = 0) -> str:
+async def list_alerts(since_id: int = 0, limit: int = 10, alert_id: int = 0, wait_s: float = 0,
+                      ai_queue: bool = False) -> str:
     """Alerts from the server's always-on detection, with their pending actions.
 
     Args:
@@ -416,7 +417,10 @@ async def list_alerts(since_id: int = 0, limit: int = 10, alert_id: int = 0, wai
         limit: Maximum number of alerts (default 10).
         alert_id: Return this one alert in full: evidence collected at alert time and report.
         wait_s: With since_id, wait up to this many seconds (max 25) for a new alert (notifiers).
+        ai_queue: Only the alerts the rules could not handle and the AI has not decided yet.
     """
+    if ai_queue:
+        return await _agent_call("list_alerts", ai_queue=True)
     if alert_id:
         return await _agent_call("list_alerts", alert_id=alert_id)
     return await _agent_call("list_alerts", since_id=since_id, limit=limit, wait_s=wait_s)

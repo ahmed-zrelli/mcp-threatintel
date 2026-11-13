@@ -28,6 +28,7 @@ from .findings import Finding, extract_findings
 from .forensics import Forensics, collect_evidence
 from .scanner import HostScanner
 from .store import ResponderDB
+from .actions import TransitionError
 from .validators import ValidationError
 
 logger = logging.getLogger("threatintel.responder.alerts")
@@ -67,6 +68,14 @@ def finding_keys(finding: Finding) -> set[str]:
     return keys
 
 
+#: Detections the rules handle alone: threat-intel matches and unambiguous attack behavior.
+RULE_KINDS = {"c2_connection", "malicious_dns", "malicious_file", "malicious_process", "ssh_bruteforce",
+              "ssh_login_from_malicious_ip", "ssh_attempt_from_malicious_ip", "port_scan", "reverse_shell"}
+#: Refusals that mean "intentionally not acted on" or "already gone", not "the rules could not cope".
+HANDLED_REFUSALS = ("allowlisted", "protected", "refusing to", "no process with pid", "does not exist",
+                    "no longer exists", "already exited")
+
+
 ACTION_PARAM = {  # MCP tool argument -> action parameter
     "block_ip": "ip", "kill_process": "pid", "quarantine_file": "path", "sinkhole_domain": "domain",
     "lock_user": "user",
@@ -75,13 +84,15 @@ ACTION_PARAM = {  # MCP tool argument -> action parameter
 
 class AlertEngine:
     def __init__(self, db: ResponderDB, manager: ActionManager, scanner: HostScanner, *,
-                 interval_s: int = 30, window_min: int = 10, aggregate_minutes: int = 10):
+                 interval_s: int = 30, window_min: int = 10, aggregate_minutes: int = 10,
+                 rules_execute: bool = False):
         self.db = db
         self.manager = manager
         self.scanner = scanner
         self.interval_s = interval_s
         self.window_min = window_min
         self.aggregate_minutes = aggregate_minutes
+        self.rules_execute = rules_execute
         # Evidence needs the real scanner (IOC index + collectors); test doubles skip it.
         self.forensics = Forensics(scanner, db) if hasattr(scanner, "iocs") else None
         self.last_run: str | None = None
@@ -143,6 +154,26 @@ class AlertEngine:
             return self.manager.create(tool, params, args.get("reason", ""), "auto-detect")
         except ValidationError as e:
             return {"id": None, "type": tool, "status": "rejected", "error": str(e)}
+
+    def _apply_rules(self, finding: Finding, actions: list[dict]) -> tuple[str, list[dict]]:
+        """Rules act first. Returns (route, actions): "rules" when they handled it, "ai" otherwise."""
+        if not self.rules_execute or finding.kind not in RULE_KINDS:
+            return "ai", actions
+        unable, out = False, []
+        for a in actions:
+            if a.get("status") == "pending" and a.get("id") and not a.get("duplicate"):
+                try:
+                    a = self.manager.approve(a["id"], "rules")
+                except TransitionError:
+                    unable = True
+            if a.get("status") == "rejected":
+                err = str((a.get("result") or {}).get("error") or a.get("error") or "").lower()
+                if not any(k in err for k in HANDLED_REFUSALS):
+                    unable = True
+            out.append(a)
+        if not actions and not finding.detail.get("allowlisted"):
+            unable = True
+        return ("ai" if unable else "rules"), out
 
     def handle(self, finding: Finding) -> int | None:
         with self._lock:
@@ -213,6 +244,7 @@ class AlertEngine:
             finding.detail = {**finding.detail, "recurrence_of": recurrence_of}
 
         actions = [self._create(tool, args) for tool, args in finding.plan]
+        route, actions = self._apply_rules(finding, actions)
         ids = [a["id"] for a in actions if a.get("id")]
 
         # 3. Malware still hitting a C2 that is already blocked: contained, but the cause is still there.
@@ -230,8 +262,9 @@ class AlertEngine:
             finding.title = (f"CONTAINED but persisting: {finding.title} - attempts are blocked, "
                              f"the process behind them is still running")
             self.db.update_incident(incident["id"], persisting_notified=True)
+            route = "ai"   # blocked, but the cause is still running: the AI looks deeper
 
-        detail = {**finding.detail, "actions": [
+        detail = {**finding.detail, "route": route, "actions": [
             {k: a.get(k) for k in ("id", "type", "target", "status", "duplicate")}
             | ({"error": (a.get("result") or {}).get("error") or a.get("error")} if a.get("status") == "rejected" else {})
             for a in actions
@@ -253,9 +286,10 @@ class AlertEngine:
                                         recurrence_of=recurrence_of if event == "reopened" else None,
                                         incident_id=incident_id, incident_event=event)
         self.db.append_audit("auto-detect", "alert", None, alert_id=alert_id, incident_id=incident_id,
-                             incident_event=event, severity=finding.severity, title=finding.title, actions=ids)
-        logger.warning("ALERT #%d incident #%d (%s) [%s] %s -> actions %s", alert_id, incident_id, event,
-                       finding.severity, finding.title, ids)
+                             incident_event=event, severity=finding.severity, title=finding.title, actions=ids,
+                             route=route)
+        logger.warning("ALERT #%d incident #%d (%s) [%s] %s -> actions %s, handled by %s", alert_id, incident_id,
+                       event, finding.severity, finding.title, ids, route)
         return alert_id
 
     def tick(self) -> list[int]:

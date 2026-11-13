@@ -113,7 +113,9 @@ def extract_findings(report: dict) -> list[Finding]:
             continue
         reason = (f"{d.get('failures')} failed / {d.get('accepted')} successful SSH logins from {ip} "
                   f"(users: {users})" + (f", IOC: {_source(d.get('ioc_matches'))}" if d.get("known_malicious") else ""))
-        out.append(Finding(kind, f"{kind}:{ip}", title, d, sev, [("block_ip", {"ip": ip, "reason": reason})]))
+        # Many failed logins are evidence by themselves: a LAN attacker may be blocked too (not the allowlist).
+        plan = {"ip": ip, "reason": reason} | ({"behavior": True} if kind == "ssh_bruteforce" else {})
+        out.append(Finding(kind, f"{kind}:{ip}", title, d, sev, [("block_ip", plan)]))
 
     out += behavior_findings(report.get("behavior") or {})
     out.sort(key=lambda f: SEVERITY_ORDER.get(f.severity, 9))

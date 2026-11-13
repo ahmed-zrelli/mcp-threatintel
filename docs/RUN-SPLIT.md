@@ -63,13 +63,20 @@ The first poller cycle pushes the intel database to the agent (dashboard header:
 - **Alerts appear on the dashboard** as soon as the agent detects something (feeds and
   behavior: port scans, reverse shells, new listening ports, account changes, system-file
   changes, SSH brute force, C2 connections, malicious DNS/files/processes).
-- Rules propose actions instantly (pending, "Waiting for the AI"). When you ask Qwen to
-  investigate, it decides: **every action it requests is executed** — block_ip,
-  sinkhole_domain, quarantine_file, kill_process, lock_user (max `AUTONOMY_MAX_PER_HOUR`,
-  default 20/hour). The server still refuses protected targets (allowlist, root, your
-  account, system processes). You can Cancel a pending action or Rollback an executed one.
-- **The AI never starts on its own.** To get an analysis, type in the WebUI:
-  `Investigate alert 12`. The report is saved and shown on the dashboard.
+- **Rules act first, on the server, instantly** (dashboard: "Handled by: rules"): threat-feed
+  matches (C2 connection, malicious DNS / file / command line), SSH brute force and logins from
+  known-bad IPs, port scans and reverse shells are blocked / killed / quarantined at once, even
+  when the PC is off.
+- **What the rules cannot handle goes to the AI automatically** ("AI: queued"): unusual behavior
+  (new listening port, account changes, system-file changes, suspicious command lines), a
+  refused or failed rule action, an attack that persists. The "AI responder" window on the PC
+  runs Qwen on each of them in a fresh conversation; Qwen decides (execute / dismiss / escalate)
+  and **its actions are executed — no human approval** (limits: `AUTONOMY_MAX_PER_HOUR`, the
+  allowlist, protected accounts and processes). If llama-server is off, those alerts wait and
+  are decided as soon as it runs.
+- You can still Cancel a pending action or Rollback an executed one on the dashboard.
+- The AI's report and decision appear on the alert (click it). You can also chat with Qwen in
+  the WebUI ("Investigate alert 12", "Block 45.1.2.3"): those requests are executed too.
 - Active responses show their time left and a Rollback button.
 - Report: dashboard → Incident report (or `threatintel-approve report --incident 3`).
 

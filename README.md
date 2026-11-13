@@ -17,8 +17,9 @@ v2 turns the intel server into a lightweight SOAR for a protected Ubuntu server:
   llama-server), feed poller that pushes intel to the agent, and a dashboard
   (`threatintel-console`) with live alerts, Cancel / Rollback, live SSH/port-scan activity,
   audit trail and incident reports.
-- AI mode only: the local model decides when the analyst asks it to investigate, and every
-  action it requests is executed, inside server-side guardrails (validation, allowlist,
+- Rules first, AI next: the agent's rules execute the clear-cut responses at once; what they
+  cannot handle is routed automatically to the local model (AI responder on the PC), which
+  decides and whose actions are executed, inside server-side guardrails (validation, allowlist,
   protected accounts and processes, hourly limit). Two TLS channels with a pinned
   certificate: the AI side and the analyst's dashboard side.
 

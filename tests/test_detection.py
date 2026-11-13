@@ -95,8 +95,8 @@ def test_sampled_short_connection_is_reported_after_it_closed(db, tmp_path):
     sampler.seen.upsert(("203.0.113.66", 443, 999999), time.time() - 30, remote_ip="203.0.113.66",
                         remote_port=443, local_port=50000, status="ESTABLISHED", pid=999999, process="curl")
     out = _scanner(db, tmp_path, sampler=sampler).scan_connections()
-    hit = out["malicious"][0]
-    assert hit["remote_ip"] == "203.0.113.66" and hit["active"] is False and hit["last_seen_s_ago"] >= 29
+    hit = next(h for h in out["malicious"] if h["remote_ip"] == "203.0.113.66")   # the PC may have live hits too
+    assert hit["active"] is False and hit["last_seen_s_ago"] >= 29
 
 
 def test_files_match_any_hash_type_and_are_cached(db, tmp_path):

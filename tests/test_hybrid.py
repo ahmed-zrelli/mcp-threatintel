@@ -1,0 +1,122 @@
+"""Hybrid response: rules act first, the AI automatically decides what they cannot handle."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from types import SimpleNamespace
+
+from mcp_threatintel.watch import watcher
+from mcp_threatintel.watch.llm import budgets, compact, fit
+from test_responder import AGENT_TOKEN, agent, backend, call, config, ioc_db  # noqa: F401  (shared fixtures)
+
+
+def _raise(agent, section, rec):  # noqa: F811
+    eng = agent.detector
+    eng.on_behavior(section, rec) if section else None
+    ids = []
+    while not eng.events.empty():
+        ids += eng.process_event(eng.events.get_nowait())
+    return [agent.db.get_alert(i) for i in ids]
+
+
+def test_rules_execute_clear_cut_attacks(agent):  # noqa: F811
+    agent.detector.rules_execute = True
+    agent.detector.on_connection({"remote_ip": "45.1.2.3", "remote_port": 443, "pid": None, "process": "curl"})
+    (alert,) = _raise(agent, None, None)
+    assert alert["detail"]["route"] == "rules"
+    (act,) = [agent.db.get_action(i) for i in alert["action_ids"]]
+    assert act["status"] == "approved" and act["approved_by"] == "rules"
+    asyncio.run(agent.process_approved())
+    assert agent.db.get_action(act["id"])["status"] == "executed"
+    assert call(agent, "agent", "list_alerts", ai_queue=True)["data"] == []      # nothing for the AI
+
+
+def test_unclear_behavior_goes_to_the_ai(agent):  # noqa: F811
+    agent.detector.rules_execute = True
+    (alert,) = _raise(agent, "new_listeners", {"key": "tcp:8771:python3", "port": 8771, "address": "0.0.0.0",
+                                               "pid": 999999, "process": "python3", "severity": "high",
+                                               "observed_at": 1e10})
+    assert alert["detail"]["route"] == "ai"
+    queue = call(agent, "agent", "list_alerts", ai_queue=True)["data"]
+    assert [q["id"] for q in queue] == [alert["id"]]                     # waiting for the AI
+
+
+def test_allowlisted_source_is_handled_not_escalated(agent):  # noqa: F811
+    agent.detector.rules_execute = True
+    agent.allowlist.add("192.168.21.1", "ip", "analyst PC")
+    (alert,) = _raise(agent, "port_scans", {"src_ip": "192.168.21.1", "distinct_ports": 30, "window_s": 10,
+                                            "allowlisted": "analyst PC", "observed_at": 1e10})
+    assert alert["detail"]["route"] == "rules" and alert["action_ids"] == []
+
+
+def test_a_failed_rule_action_hands_the_alert_to_the_ai(agent, backend):  # noqa: F811
+    agent.detector.rules_execute = True
+    agent.detector.on_connection({"remote_ip": "45.1.2.3", "remote_port": 443, "pid": None, "process": "curl"})
+    (alert,) = _raise(agent, None, None)
+    orig = backend.apply
+
+    def boom(action):
+        raise RuntimeError("nft not available")
+    backend.apply = boom
+    asyncio.run(agent.process_approved())
+    backend.apply = orig
+    assert agent.db.get_alert(alert["id"])["detail"]["route"] == "ai"
+    assert [q["id"] for q in call(agent, "agent", "list_alerts", ai_queue=True)["data"]] == [alert["id"]]
+
+
+def test_repeated_entries_are_grouped_not_cut():
+    conns = [{"remote_ip": "9.9.9.9", "remote_port": 443, "pid": 2505, "last_seen": i, "observed_at": i}
+             for i in range(63)]
+    out = compact({"connections": conns, "sha256": "a" * 64})
+    assert out["connections"] == [{"remote_ip": "9.9.9.9", "remote_port": 443, "pid": 2505, "last_seen": 0,
+                                   "observed_at": 0, "repeated": 63}]
+    assert out["sha256"] == "a" * 64                                             # evidence kept whole
+    big = json.dumps({"rows": [{"n": i} for i in range(500)]})
+    small = fit(big, 400)
+    assert len(small) <= 450 and "more_entries_not_shown" in small
+    brief, per_tool = budgets(8192)
+    assert brief > per_tool >= 1500 and budgets(16384)[1] > per_tool
+
+
+class QueueMCP:
+    """MCP double: one AI alert that the model never resolves."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def call_tool(self, name, args):
+        self.calls.append((name, args))
+        if args.get("ai_queue"):
+            data = [{"id": 7, "actions": []}]
+        elif args.get("alert_id"):
+            data = {"id": 7, "kind": "new_listener", "severity": "high", "title": "t", "actions": [], "detail": {}}
+        else:
+            data = {"ok": True}
+        return SimpleNamespace(content=[SimpleNamespace(text=json.dumps(data))])
+
+
+def test_responder_waits_for_qwen_then_escalates_if_it_cannot_decide(monkeypatch):
+    mcp = QueueMCP()
+    args = SimpleNamespace(no_ai=False, llm_url="http://llm", llm_timeout=5, llm_context=8192)
+    r = watcher.Responder(mcp, args)
+    up = {"v": False}
+
+    async def available(url):
+        return up["v"]
+
+    async def no_decision(*a, **k):
+        return "VERDICT: unsure", []
+    monkeypatch.setattr(watcher, "llm_available", available)
+    monkeypatch.setattr(watcher, "investigate", no_decision)
+    monkeypatch.setattr(watcher, "notify", lambda *a: True)
+    alert = {"id": 7}
+    asyncio.run(r.decide(alert))                                    # Qwen off: nothing saved, retried later
+    assert not any(n == "save_alert_report" for n, _ in mcp.calls) and r.next_try[7] > 0
+    up["v"] = True
+    for _ in range(watcher.MAX_AI_ATTEMPTS):
+        r.next_try[7] = 0
+        asyncio.run(r.decide(alert))
+    resolved = [a for n, a in mcp.calls if n == "resolve_alert"]
+    assert resolved and resolved[-1]["decision"] == "escalate"
+    assert AGENT_TOKEN

@@ -25,7 +25,7 @@ import logging
 import os
 import secrets
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .actions import ActionManager, TransitionError
 from .backends import BackendError, CommandRunner, build_backends
@@ -93,7 +93,8 @@ class HostAgent:
         self.scanner = HostScanner(config, self.iocs, self.sampler, self.dns)
         self.manager = ActionManager(self.db, self.allowlist, self.iocs, config)
         self.detector = AlertEngine(self.db, self.manager, self.scanner, interval_s=config.detect_interval,
-                                    aggregate_minutes=config.alert_aggregate_minutes)
+                                    aggregate_minutes=config.alert_aggregate_minutes,
+                                    rules_execute=config.rules_execute)
         self.autonomy = Autonomy(self.db, self.manager, config)
         # Event-driven detection: collectors report new observables straight to the engine.
         self.sampler.on_new = self.detector.on_connection
@@ -167,6 +168,8 @@ class HostAgent:
             return await asyncio.to_thread(self.scanner.scan_dns, int(p.get("minutes", 10)))
         if op == "scan_processes":
             return await asyncio.to_thread(self.scanner.scan_processes)
+        if op == "list_alerts" and p.get("ai_queue"):
+            return await asyncio.to_thread(self._ai_queue)
         if op == "list_alerts":
             if p.get("alert_id"):  # one alert in full: evidence and report included
                 alert = self.db.get_alert(int(p["alert_id"]))
@@ -297,6 +300,21 @@ class HostAgent:
                                  limit=max(1, min(int(p.get("limit", 50)), 500)))
         raise TransitionError(f"unknown operation {op!r}")
 
+    def _ai_queue(self) -> list[dict]:
+        """Alerts the rules could not handle, not yet decided by the AI (last 48 h, oldest first)."""
+        since = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat(timespec="seconds")
+        out = []
+        for a in self.db.alerts_since(since):
+            if a["detail"].get("route") != "ai" or a.get("resolution"):
+                continue
+            acts = [x for x in (self.db.get_action(i) for i in a["action_ids"]) if x]
+            if not any(x["status"] == "pending" for x in acts) and a["severity"] not in ("critical", "high"):
+                continue   # nothing to decide (e.g. an informational low alert)
+            out.append({"id": a["id"], "ts": a["ts"], "kind": a["kind"], "severity": a["severity"],
+                        "title": a["title"], "incident_id": a.get("incident_id"),
+                        "actions": [{k: x[k] for k in ("id", "type", "target", "status")} for x in acts]})
+        return out[:20]
+
     def _overview(self) -> dict:
         """Everything the dashboard shows, in one admin call."""
         incidents = self.db.list_incidents(15)
@@ -347,6 +365,9 @@ class HostAgent:
         except Exception as e:
             logger.error("action %s failed: %s", action["id"], e)
             self.manager.transition(action["id"], "failed", "responder", result={"error": str(e)})
+            if action.get("approved_by") == "rules":   # the rules could not finish: hand the alert to the AI
+                for alert_id in self.db.alerts_with_action(action["id"]):
+                    self.db.set_alert_route(alert_id, "ai")
             return
         self.manager.transition(
             action["id"], "executed", "responder", executed_at=now_iso(),
