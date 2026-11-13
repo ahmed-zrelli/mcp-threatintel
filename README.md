@@ -4,6 +4,25 @@ A threat intelligence MCP server for [Claude Code](https://claude.com/claude-cod
 
 Built with [FastMCP](https://github.com/jlowin/fastmcp) and SQLite. Feeds are synced locally by a background poller so lookups are fast and don't depend on external API availability.
 
+## v2: detection and response (this fork)
+
+v2 turns the intel server into a lightweight SOAR for a protected Ubuntu server:
+
+- **Host agent** (`threatintel-responder`, the only component on the server): always-on
+  detection from threat feeds (C2 connections, malicious DNS, files, command lines, SSH) and
+  from behavior (port scans, reverse shells, new listening ports, account and system-file
+  changes, SSH brute force); incidents; rule-based pending actions; validated, audited,
+  reversible responses (nftables block, DNS sinkhole, quarantine, kill, lock_user).
+- **Console on the analyst PC**: MCP server (28 tools) for a local model (Qwen via
+  llama-server), feed poller that pushes intel to the agent, and a dashboard
+  (`threatintel-console`) with Approve/Reject, Rollback, Human/AI decision switch, live
+  SSH/port-scan activity, audit trail and incident reports.
+- Two TLS channels with a pinned certificate: the AI side can propose; only the admin side
+  (dashboard / `threatintel-approve`) can decide.
+
+Guides: [docs/RUN-SPLIT.md](docs/RUN-SPLIT.md) (recommended), [docs/RUN-UBUNTU.md](docs/RUN-UBUNTU.md),
+[docs/RUN-WINDOWS.md](docs/RUN-WINDOWS.md) (everything on one PC), [docs/qwen-system-prompt.md](docs/qwen-system-prompt.md).
+
 ---
 
 ## Tools

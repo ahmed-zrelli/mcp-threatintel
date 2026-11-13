@@ -1,61 +1,62 @@
-# mcp-threatintel v2 on the Ubuntu server (phase 2)
+# mcp-threatintel v2 on the Ubuntu server
 
-The Ubuntu server is the protected infrastructure. The MCP server, the poller
-and the privileged host agent all run on it, and every action (firewall block,
-DNS sinkhole, quarantine, process kill) happens **on the server**. The analyst
-PC only runs Qwen (llama-server + WebUI) and connects to the MCP server over
-the network.
-
-```
-Analyst PC (Windows)                         Ubuntu server (protected)
-  llama-server + WebUI  ──HTTP :3707/mcp──▶  [docker] mcp-threatintel ──agent.sock──▶ threatintel-responder (systemd, root)
-  ssh  ──────────────────────────────────▶   threatintel-approve ──admin.sock──▶        │  nftables · /etc/hosts
-                                             [docker] threatintel-poller ──▶ threatintel.db   quarantine · processes
-```
+The Ubuntu server is the protected infrastructure. It runs **only the host agent**
+(`threatintel-responder`, systemd, root): always-on detection and every response
+action (nftables block, DNS sinkhole, quarantine, process kill, account lock) happen
+**on the server**. The console (MCP server for Qwen, feed poller, dashboard) runs on
+the analyst PC — see [RUN-SPLIT.md](RUN-SPLIT.md) for the full setup.
 
 ## Install (once, on the server)
-
-Copy the project to the server (with your `.env` holding `ABUSECH_API_KEY`), then:
 
 ```bash
 cd ~/mcp-threatintel
 sudo ANALYST_IP=<your PC IP> bash scripts/ubuntu/setup-ubuntu.sh
 ```
 
-It installs nftables, Docker Compose and a Python venv in `/opt/threatintel`,
-creates the `threatintel` and `threatintel-admin` groups, loads the firewall
-table `inet threatintel` (port 3707 open to `ANALYST_IP` only), installs the
-agent as the systemd service `threatintel-responder` (dry-run first), builds
-the image and starts both containers. Re-running it is safe.
+It installs nftables and a Python venv in `/opt/threatintel`, creates the
+`threatintel` and `threatintel-admin` groups, loads the firewall table
+`inet threatintel` (agent ports 3712/3713 open to `ANALYST_IP` only, SYN logging for
+port-scan detection), creates the agent's TLS certificate and installs the agent
+(dry-run first). Re-running it is safe. `WITH_CONTAINERS=1` also runs the old
+all-on-the-server containers.
 
 | Path | Content | Access |
 |---|---|---|
 | `/etc/threatintel/responder.env` | agent settings, `AGENT_TOKEN` | root only |
-| `/etc/threatintel/admin.token` | approval token | root + `threatintel-admin` |
+| `/etc/threatintel/admin.token` | admin-channel token | root + `threatintel-admin` |
+| `/etc/threatintel/agent.key` / `agent.crt` | TLS key / certificate | key root only |
+| `/etc/threatintel/console/` | bundle to copy to the PC | root + `threatintel-admin` |
 | `/etc/threatintel/threatintel.nft` | firewall table | read-only |
-| `/var/lib/threatintel/data/` | `threatintel.db` (cache) | containers (UID 1000), agent reads |
-| `/var/lib/threatintel/responder/` | `responder.db`, quarantine, hosts backup | root only |
-| `/run/threatintel/agent.sock` | MCP container → agent | `threatintel` group |
-| `/run/threatintel-admin/admin.sock` | analyst CLI → agent | `threatintel-admin` group |
+| `/var/lib/threatintel/data/threatintel.db` | intel snapshot pushed by the console | agent |
+| `/var/lib/threatintel/responder/` | `responder.db` (actions, alerts, audit, baselines), quarantine | root only |
+| TLS `:3712` / `:3713` | agent / admin channel (from the PC) | analyst PC only |
+| `/run/threatintel*/…sock` | the same channels, locally | groups above |
 
-## Use
+## Settings worth knowing (`responder.env`)
 
-- WebUI on the PC: MCP server `http://<server IP>:3707/mcp`.
-- Approve from the PC: `ssh <server>` then `threatintel-approve list` /
-  `threatintel-approve approve <id>` (log in again once after install so the
-  `threatintel-admin` group applies).
-- Real mode: set `RESPONDER_DRY_RUN=false` in `/etc/threatintel/responder.env`,
-  then `sudo systemctl restart threatintel-responder`.
+| Variable | Meaning |
+|---|---|
+| `RESPONDER_DRY_RUN` | `true` = commands only logged; `false` = applied |
+| `ALLOWED_CLIENTS` | IPs allowed on the TLS channels (the analyst PC) |
+| `PROTECTED_USERS` | accounts `lock_user` never touches (root, the analyst) |
+| `AUTONOMY` | initial decision mode; the dashboard switch overrides it and is kept |
+
+## Use on the server itself (optional)
+
+`threatintel-approve list | approve <id> | reject <id> | rollback <id> | mode [human|ai] |
+alerts | incidents | report` (log in again after install so the `threatintel-admin`
+group applies).
 
 ## Check
 
 ```bash
-sudo nft list table inet threatintel        # blocklist set and rules
+sudo nft list table inet threatintel        # blocklist, port rules, ti-syn log rule
 sudo systemctl status threatintel-responder
 sudo journalctl -u threatintel-responder -f
-docker compose ps && docker compose logs -f
+sudo journalctl -k | grep ti-syn | tail     # inbound connection attempts seen for scan detection
 threatintel-approve audit
 ```
 
-After a reboot the agent reloads the table and re-applies the blocks that are
-still valid.
+After a reboot the agent reloads the table and re-applies the blocks that are still
+valid. Behavior baselines (accounts, system files, listening ports) are stored in
+`responder.db`, so changes made while the agent was stopped are reported at start.
