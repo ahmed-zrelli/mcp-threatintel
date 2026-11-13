@@ -150,7 +150,12 @@ class Responder:
 
     async def queue(self) -> list[dict]:
         data = _text(await self.mcp.call_tool("list_alerts", {"ai_queue": True}))
-        return data if isinstance(data, list) else []
+        if isinstance(data, dict) and isinstance(data.get("ai_queue"), list):
+            return data["ai_queue"]
+        if not getattr(self, "old_agent_logged", False):   # an older agent answers with plain alerts: never act on those
+            out("    the host agent does not support the AI queue yet (update it on the server); AI responder idle")
+            self.old_agent_logged = True
+        return []
 
     async def sweep(self, jobs: asyncio.Queue) -> None:
         """Queue every AI-routed alert not decided yet (new ones and the backlog)."""

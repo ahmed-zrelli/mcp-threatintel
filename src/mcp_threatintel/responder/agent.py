@@ -169,7 +169,7 @@ class HostAgent:
         if op == "scan_processes":
             return await asyncio.to_thread(self.scanner.scan_processes)
         if op == "list_alerts" and p.get("ai_queue"):
-            return await asyncio.to_thread(self._ai_queue)
+            return {"ai_queue": await asyncio.to_thread(self._ai_queue)}
         if op == "list_alerts":
             if p.get("alert_id"):  # one alert in full: evidence and report included
                 alert = self.db.get_alert(int(p["alert_id"]))

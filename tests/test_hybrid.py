@@ -29,7 +29,7 @@ def test_rules_execute_clear_cut_attacks(agent):  # noqa: F811
     assert act["status"] == "approved" and act["approved_by"] == "rules"
     asyncio.run(agent.process_approved())
     assert agent.db.get_action(act["id"])["status"] == "executed"
-    assert call(agent, "agent", "list_alerts", ai_queue=True)["data"] == []      # nothing for the AI
+    assert call(agent, "agent", "list_alerts", ai_queue=True)["data"]["ai_queue"] == []      # nothing for the AI
 
 
 def test_unclear_behavior_goes_to_the_ai(agent):  # noqa: F811
@@ -38,7 +38,7 @@ def test_unclear_behavior_goes_to_the_ai(agent):  # noqa: F811
                                                "pid": 999999, "process": "python3", "severity": "high",
                                                "observed_at": 1e10})
     assert alert["detail"]["route"] == "ai"
-    queue = call(agent, "agent", "list_alerts", ai_queue=True)["data"]
+    queue = call(agent, "agent", "list_alerts", ai_queue=True)["data"]["ai_queue"]
     assert [q["id"] for q in queue] == [alert["id"]]                     # waiting for the AI
 
 
@@ -62,7 +62,7 @@ def test_a_failed_rule_action_hands_the_alert_to_the_ai(agent, backend):  # noqa
     asyncio.run(agent.process_approved())
     backend.apply = orig
     assert agent.db.get_alert(alert["id"])["detail"]["route"] == "ai"
-    assert [q["id"] for q in call(agent, "agent", "list_alerts", ai_queue=True)["data"]] == [alert["id"]]
+    assert [q["id"] for q in call(agent, "agent", "list_alerts", ai_queue=True)["data"]["ai_queue"]] == [alert["id"]]
 
 
 def test_repeated_entries_are_grouped_not_cut():
@@ -88,12 +88,20 @@ class QueueMCP:
     async def call_tool(self, name, args):
         self.calls.append((name, args))
         if args.get("ai_queue"):
-            data = [{"id": 7, "actions": []}]
+            data = {"ai_queue": [{"id": 7, "actions": []}]}
         elif args.get("alert_id"):
             data = {"id": 7, "kind": "new_listener", "severity": "high", "title": "t", "actions": [], "detail": {}}
         else:
             data = {"ok": True}
         return SimpleNamespace(content=[SimpleNamespace(text=json.dumps(data))])
+
+
+def test_responder_ignores_an_agent_without_ai_queue():
+    class OldAgentMCP(QueueMCP):
+        async def call_tool(self, name, args):
+            return SimpleNamespace(content=[SimpleNamespace(text=json.dumps([{"id": 1, "title": "old alert"}]))])
+    r = watcher.Responder(OldAgentMCP(), SimpleNamespace())
+    assert asyncio.run(r.queue()) == []                            # plain alert list: never treated as AI work
 
 
 def test_responder_waits_for_qwen_then_escalates_if_it_cannot_decide(monkeypatch):
