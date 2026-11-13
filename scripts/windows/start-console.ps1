@@ -6,7 +6,7 @@
 #
 # Needs the console bundle copied from the server into .\console\
 #   scp -i <key> <user>@<server>:/etc/threatintel/console/* console\
-param([switch]$NoPoller)
+param([switch]$NoPoller, [switch]$DashboardOnly)
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $bundle = Join-Path $root "console"
@@ -31,8 +31,8 @@ function Start-Window($title, $exe, $argList) {
 }
 
 Write-Host "Agent: $env:AGENT_ADDR (admin $env:ADMIN_ADDR)"
-Start-Window "MCP server (Qwen tools)" "mcp-threatintel.exe" ""
-if (-not $NoPoller) { Start-Window "Feed poller (pushes intel to the agent)" "mcp-threatintel-poller.exe" "--loop" }
+if (-not $DashboardOnly) { Start-Window "MCP server (Qwen tools)" "mcp-threatintel.exe" "" }
+if (-not $NoPoller -and -not $DashboardOnly) { Start-Window "Feed poller (pushes intel to the agent)" "mcp-threatintel-poller.exe" "--loop" }
 Start-Window "Dashboard" "threatintel-console.exe" ""
 Start-Sleep -Seconds 3
 Start-Process "http://127.0.0.1:3720"

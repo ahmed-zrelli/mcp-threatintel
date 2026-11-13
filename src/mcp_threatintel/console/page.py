@@ -17,7 +17,8 @@ PAGE = r"""<!doctype html>
 header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;padding:14px 20px;
 background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
 h1{font-size:17px;margin:0;font-weight:650}h2{font-size:14px;margin:0 0 10px;font-weight:650;display:flex;gap:8px;align-items:center}
-main{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:16px;padding:16px 20px;max-width:1600px;margin:0 auto}
+main{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;padding:16px 20px;max-width:1800px;margin:0 auto}
+@media (max-width:900px){main{grid-template-columns:1fr}}
 section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;box-shadow:var(--shadow);min-width:0}
 section.wide{grid-column:1/-1}
 .status{display:flex;flex-wrap:wrap;gap:8px;align-items:center;color:var(--muted);font-size:13px}
