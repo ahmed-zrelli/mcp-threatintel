@@ -1,4 +1,9 @@
-"""Autonomous mode: the model may resolve an alert itself, inside server-side guardrails.
+"""AI mode: the local model decides, inside server-side guardrails.
+
+The agent runs in AI mode only. Every action the model requests (MCP response tools, rollbacks) is
+approved at once by approve_request(), and resolve_alert lets it execute or dismiss the actions the
+detection rules proposed for an alert. The analyst can still cancel a pending action or roll back an
+executed one from the dashboard.
 
     resolve(alert_id, decision, justification)
         execute   approve the alert's pending actions
@@ -39,7 +44,7 @@ class Autonomy:
         self.config = config
 
     def status(self) -> dict:
-        return {"enabled": self.config.autonomy, "mode": "ai" if self.config.autonomy else "human",
+        return {"enabled": self.config.autonomy, "mode": "ai" if self.config.autonomy else "approval",
                 "allowed_actions": list(self.config.autonomy_actions),
                 "max_per_hour": self.config.autonomy_max_per_hour,
                 "used_last_hour": self._used_last_hour()}
@@ -47,6 +52,19 @@ class Autonomy:
     def _used_last_hour(self) -> int:
         since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
         return self.db.count_audit_since(ACTOR, "approved", since)
+
+    def approve_request(self, action: dict) -> dict:
+        """An action the model asked for: executed now (validation, allowlist and the hourly limit apply)."""
+        if not self.config.autonomy or action.get("status") != "pending" or action.get("duplicate"):
+            return action
+        if action["type"] != "rollback" and action["type"] not in self.config.autonomy_actions:
+            return {**action, "left_pending": f"{action['type']} is not in AUTONOMY_ACTIONS"}
+        if self._used_last_hour() >= self.config.autonomy_max_per_hour:
+            return {**action, "left_pending": "hourly AI limit reached (AUTONOMY_MAX_PER_HOUR)"}
+        try:
+            return self.manager.approve(action["id"], ACTOR)
+        except TransitionError as e:
+            return {**action, "left_pending": str(e)}
 
     def resolve(self, alert_id: int, decision: str, justification: str) -> dict:
         decision = (decision or "").strip().lower()
@@ -104,7 +122,8 @@ class Autonomy:
                     left.append({"id": a["id"], "type": a["type"], "reason": str(e)})
             resolution = "dismissed"
         else:
-            left = [{"id": a["id"], "type": a["type"], "reason": "escalated to a human"} for a in pending]
+            left = [{"id": a["id"], "type": a["type"], "reason": "left pending (AI unsure); the analyst "
+                     "can cancel it on the dashboard"} for a in pending]
             resolution = "escalated"
 
         self.db.save_resolution(alert["id"], resolution, ACTOR, justification)

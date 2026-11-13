@@ -2,9 +2,10 @@
 
 Runs on the analyst PC and talks to the host agent ONLY through the admin
 channel (ADMIN_ADDR, admin token, TLS with the pinned agent certificate).
-It shows alerts, incidents, pending actions (Approve / Reject), active
-responses (Rollback), live SSH and port-scan activity, the audit trail and
-the Human / AI decision switch, and generates incident reports.
+The local model decides (AI mode only). The dashboard shows alerts,
+incidents, actions waiting for the AI (Cancel), what the AI executed
+(Rollback), live SSH and port-scan activity and the audit trail, and
+generates incident reports.
 
 The AI never starts from here: the model runs only when the analyst asks it
 in the llama-server WebUI ("investigate alert N").
@@ -110,16 +111,11 @@ def create_app(client: AdminClient, session_token: str | None = None) -> Starlet
     async def act(req):
         verb, action_id = req.path_params["verb"], int(req.path_params["id"])
         b = await body(req)
-        if verb == "approve":
-            return await run(req, "approve", id=action_id)
         if verb == "reject":
             return await run(req, "reject", id=action_id, reason=str(b.get("reason") or "rejected on dashboard"))
         if verb == "rollback":
             return await run(req, "rollback", id=action_id, reason=str(b.get("reason") or "rolled back on dashboard"))
         return JSONResponse({"error": "unknown verb"}, status_code=404)
-
-    async def mode(req):
-        return await run(req, "set_decision_mode", mode=str((await body(req)).get("mode") or ""))
 
     return Starlette(routes=[
         Route("/", page),
@@ -129,7 +125,6 @@ def create_app(client: AdminClient, session_token: str | None = None) -> Starlet
         Route("/api/audit", audit),
         Route("/api/report", report),
         Route("/api/actions/{id:int}/{verb}", act, methods=["POST"]),
-        Route("/api/mode", mode, methods=["POST"]),
     ])
 
 

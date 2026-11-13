@@ -39,11 +39,12 @@ all-on-the-server containers.
 | `RESPONDER_DRY_RUN` | `true` = commands only logged; `false` = applied |
 | `ALLOWED_CLIENTS` | IPs allowed on the TLS channels (the analyst PC) |
 | `PROTECTED_USERS` | accounts `lock_user` never touches (root, the analyst) |
-| `AUTONOMY` | initial decision mode; the dashboard switch overrides it and is kept |
+| `AUTONOMY_ACTIONS` | action types the AI may execute (default: all) |
+| `AUTONOMY_MAX_PER_HOUR` | AI actions per hour (default 20) |
 
 ## Use on the server itself (optional)
 
-`threatintel-approve list | approve <id> | reject <id> | rollback <id> | mode [human|ai] |
+`threatintel-approve list | reject <id> | rollback <id> | mode |
 alerts | incidents | report` (log in again after install so the `threatintel-admin`
 group applies).
 

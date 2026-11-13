@@ -114,7 +114,7 @@ def build_report(db: ResponderDB, incident_id: int | None = None, hours: int = 2
     if dry_run is not None:
         L.append(f"- Agent mode: {'DRY-RUN (actions only simulated)' if dry_run else 'real (actions applied)'}")
     if decision_mode:
-        L.append(f"- Decision mode: {'AI (local model may execute reversible actions)' if decision_mode == 'ai' else 'human approval'}")
+        L.append(f"- Decision mode: {'AI (the local model decides; its actions are executed)' if decision_mode == 'ai' else 'approval'}")
     L.append("- Sources: responder.db alerts, actions and append-only audit log (facts); saved model analyses "
              "(section 7, interpretation)")
     L.append("")

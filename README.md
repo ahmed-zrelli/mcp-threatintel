@@ -15,10 +15,12 @@ v2 turns the intel server into a lightweight SOAR for a protected Ubuntu server:
   reversible responses (nftables block, DNS sinkhole, quarantine, kill, lock_user).
 - **Console on the analyst PC**: MCP server (28 tools) for a local model (Qwen via
   llama-server), feed poller that pushes intel to the agent, and a dashboard
-  (`threatintel-console`) with Approve/Reject, Rollback, Human/AI decision switch, live
-  SSH/port-scan activity, audit trail and incident reports.
-- Two TLS channels with a pinned certificate: the AI side can propose; only the admin side
-  (dashboard / `threatintel-approve`) can decide.
+  (`threatintel-console`) with live alerts, Cancel / Rollback, live SSH/port-scan activity,
+  audit trail and incident reports.
+- AI mode only: the local model decides when the analyst asks it to investigate, and every
+  action it requests is executed, inside server-side guardrails (validation, allowlist,
+  protected accounts and processes, hourly limit). Two TLS channels with a pinned
+  certificate: the AI side and the analyst's dashboard side.
 
 Guides: [docs/RUN-SPLIT.md](docs/RUN-SPLIT.md) (recommended), [docs/RUN-UBUNTU.md](docs/RUN-UBUNTU.md),
 [docs/RUN-WINDOWS.md](docs/RUN-WINDOWS.md) (everything on one PC), [docs/qwen-system-prompt.md](docs/qwen-system-prompt.md).

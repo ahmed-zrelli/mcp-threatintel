@@ -50,7 +50,7 @@ AGENT_OPS = {
     "create_action", "get_action", "list_actions", "request_rollback", "push_intel", "intel_status", "report",
 }
 ADMIN_OPS = {"ping", "list_actions", "get_action", "approve", "reject", "audit", "list_alerts", "list_incidents",
-             "set_decision_mode", "rollback", "ssh_activity", "report", "overview"}
+             "rollback", "ssh_activity", "report", "overview"}
 
 
 def summarize(action: dict) -> dict:
@@ -95,10 +95,6 @@ class HostAgent:
         self.detector = AlertEngine(self.db, self.manager, self.scanner, interval_s=config.detect_interval,
                                     aggregate_minutes=config.alert_aggregate_minutes)
         self.autonomy = Autonomy(self.db, self.manager, config)
-        # Who decides (human / ai) is switched from the dashboard and persisted; it overrides AUTONOMY.
-        saved = self.db.get_setting("decision_mode")
-        if saved in ("human", "ai"):
-            config.autonomy = saved == "ai"
         # Event-driven detection: collectors report new observables straight to the engine.
         self.sampler.on_new = self.detector.on_connection
         self.dns.on_new = self.detector.on_dns
@@ -258,9 +254,13 @@ class HostAgent:
                 self.manager.create, str(p.get("type")), dict(p.get("params") or {}),
                 str(p.get("reason") or ""), "mcp-server",
             )
-            out = summarize(action)
+            decided = await asyncio.to_thread(self.autonomy.approve_request, action)  # AI mode: execute now
+            self._wake.set()
+            out = summarize(self.db.get_action(action["id"]) or decided)
             if action.get("duplicate"):
                 out["duplicate"] = True
+            if decided.get("left_pending"):
+                out["left_pending"] = decided["left_pending"]
             return out
         if op == "get_action":
             action = self.db.get_action(int(p.get("id", 0)))
@@ -275,16 +275,10 @@ class HostAgent:
             return [summarize(a) for a in self.db.list_actions(str(p.get("status") or ""), limit)]
         if op == "request_rollback":
             action = self.manager.request_rollback(int(p.get("id", 0)), str(p.get("reason") or ""), "mcp-server")
-            return summarize(action)
+            await asyncio.to_thread(self.autonomy.approve_request, action)
+            self._wake.set()
+            return summarize(self.db.get_action(action["id"]))
         actor = f"analyst:{str(p.get('actor') or 'unknown')[:64]}"
-        if op == "set_decision_mode":
-            mode = str(p.get("mode") or "")
-            if mode not in ("human", "ai"):
-                raise ValidationError("mode must be human or ai")
-            self.config.autonomy = mode == "ai"
-            self.db.set_setting("decision_mode", mode, actor)
-            self.db.append_audit(actor, "decision_mode", None, mode=mode)
-            return self.autonomy.status()
         if op == "rollback":  # the analyst undoes an executed action: request + approve in one step
             rb = self.manager.request_rollback(int(p.get("id", 0)), str(p.get("reason") or "rolled back by analyst"),
                                                actor)

@@ -20,8 +20,9 @@ Why this split:
 - Both channels are TLS with the agent's certificate **pinned** on the PC; each has its
   own token; nftables and the agent accept only the analyst PC.
 - The agent channel (MCP server / Qwen, poller) can scan, propose actions and push intel.
-  Only the admin channel (dashboard, `threatintel-approve`) can approve, reject, roll back
-  or switch Human/AI mode.
+  The server runs in **AI mode only**: the model decides and its actions are executed. The
+  admin channel (dashboard, `threatintel-approve`) lets the analyst watch, cancel pending
+  actions and roll back what the AI did.
 
 ## 1. Server (once)
 
@@ -62,9 +63,11 @@ The first poller cycle pushes the intel database to the agent (dashboard header:
 - **Alerts appear on the dashboard** as soon as the agent detects something (feeds and
   behavior: port scans, reverse shells, new listening ports, account changes, system-file
   changes, SSH brute force, C2 connections, malicious DNS/files/processes).
-- Rules propose actions instantly (pending). **Human mode**: approve or reject them on the
-  dashboard. **AI mode**: when you ask Qwen to investigate, it may execute the alert's
-  reversible actions itself (block_ip, sinkhole_domain, quarantine_file; max 20/hour).
+- Rules propose actions instantly (pending, "Waiting for the AI"). When you ask Qwen to
+  investigate, it decides: **every action it requests is executed** — block_ip,
+  sinkhole_domain, quarantine_file, kill_process, lock_user (max `AUTONOMY_MAX_PER_HOUR`,
+  default 20/hour). The server still refuses protected targets (allowlist, root, your
+  account, system processes). You can Cancel a pending action or Rollback an executed one.
 - **The AI never starts on its own.** To get an analysis, type in the WebUI:
   `Investigate alert 12`. The report is saved and shown on the dashboard.
 - Active responses show their time left and a Rollback button.

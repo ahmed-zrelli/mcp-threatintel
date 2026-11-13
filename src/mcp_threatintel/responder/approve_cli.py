@@ -6,7 +6,7 @@
     threatintel-approve reject <id> [--reason TEXT]
     threatintel-approve audit [--id N] [--limit N]
     threatintel-approve rollback <id> [--reason TEXT]
-    threatintel-approve mode [human|ai]
+    threatintel-approve mode
     threatintel-approve report [--incident N] [--hours H] [--out FILE]
 
 Needs read access to the admin token file, i.e. an elevated terminal.
@@ -88,8 +88,7 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("rollback", help="undo an executed (reversible) action")
     p.add_argument("id", type=int)
     p.add_argument("--reason", default="")
-    p = sub.add_parser("mode", help="show or set who decides: human (approval) or ai (model may execute)")
-    p.add_argument("mode", nargs="?", choices=["human", "ai"])
+    sub.add_parser("mode", help="show the AI decision limits")
     p = sub.add_parser("report", help="incident report (Markdown): facts + labelled AI analysis")
     p.add_argument("--incident", type=int)
     p.add_argument("--hours", type=int, default=24)
@@ -164,10 +163,7 @@ def main(argv: list[str] | None = None) -> None:
         a = _call(config, "rollback", id=args.id, actor=actor, reason=args.reason or "rolled back by analyst")
         print(f"rollback #{a['id']} of action {args.id}: {a['status']}")
     elif args.cmd == "mode":
-        if args.mode:
-            s = _call(config, "set_decision_mode", mode=args.mode, actor=actor)
-        else:
-            s = _call(config, "ping")["autonomy"]
+        s = _call(config, "ping")["autonomy"]
         print(f"decision mode: {s['mode']}  (AI may execute: {', '.join(s['allowed_actions'])}; "
               f"{s['used_last_hour']}/{s['max_per_hour']} used in the last hour)")
     elif args.cmd == "report":

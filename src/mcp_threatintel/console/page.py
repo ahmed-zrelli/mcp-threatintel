@@ -24,6 +24,7 @@ section.wide{grid-column:1/-1}
 .status{display:flex;flex-wrap:wrap;gap:8px;align-items:center;color:var(--muted);font-size:13px}
 .chip{background:var(--chip);border-radius:999px;padding:2px 10px;font-size:12px;white-space:nowrap}
 .chip.real{background:var(--crit);color:#fff}.chip.dry{background:var(--ok);color:#fff}
+.chip.ai{background:var(--accent);color:#fff}
 .switch{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
 .switch button{border:0;border-radius:0;background:transparent;color:var(--ink);padding:6px 14px;cursor:pointer;font:inherit}
 .switch button.on{background:var(--accent);color:#fff}
@@ -50,14 +51,13 @@ input{font:inherit;padding:4px 8px;border:1px solid var(--line);border-radius:6p
 <header>
   <div><h1>ThreatIntel Console</h1><div class="status" id="status">connecting to the agent...</div></div>
   <div class="status">
-    <span>Who decides</span>
-    <div class="switch"><button id="mode-human">Human</button><button id="mode-ai">AI</button></div>
+    <span class="chip ai" id="ai-chip">Decisions: AI (local model)</span>
     <span id="err"></span>
   </div>
 </header>
 <main>
-  <section><h2>Pending actions <span class="chip" id="n-pending">0</span></h2><div id="pending"></div></section>
-  <section><h2>Active responses <span class="chip" id="n-active">0</span></h2><div id="active" class="scroll"></div></section>
+  <section><h2>Waiting for the AI <span class="chip" id="n-pending">0</span></h2><div id="pending"></div></section>
+  <section><h2>Executed responses <span class="chip" id="n-active">0</span></h2><div id="active" class="scroll"></div></section>
   <section class="wide"><h2>Incidents (one per attack)</h2><div id="incidents" class="scroll"></div></section>
   <section class="wide"><h2>Alerts <span class="muted">— click one for evidence and AI analysis</span></h2><div id="alerts" class="scroll"></div></section>
   <section><h2>Live SSH activity <span class="muted">(last 15 min)</span></h2><div id="ssh"></div></section>
@@ -75,7 +75,7 @@ input{font:inherit;padding:4px 8px;border:1px solid var(--line);border-radius:6p
 "use strict";
 const TOKEN = "__TOKEN__";
 const REVERSIBLE = new Set(["block_ip","sinkhole_domain","quarantine_file","block_feed_c2","lock_user"]);
-let mode = null, reportText = "";
+let reportText = "";
 
 async function api(path, opts = {}) {
   const r = await fetch(path, {...opts, headers: {"X-Dashboard-Token": TOKEN, "Content-Type": "application/json"}});
@@ -110,15 +110,10 @@ function err(e) { $("err").textContent = e ? String(e.message || e) : ""; }
 
 async function doAction(id, verb) {
   let body = {};
-  if (verb === "reject") { const r = prompt(`Reject action #${id}: reason?`, "false positive"); if (r === null) return; body.reason = r; }
+  if (verb === "reject") { const r = prompt(`Cancel action #${id}: reason?`, "false positive"); if (r === null) return; body.reason = r; }
   if (verb === "rollback" && !confirm(`Undo action #${id}?`)) return;
   try { await api(`/api/actions/${id}/${verb}`, {method: "POST", body: JSON.stringify(body)}); err(); refresh(); }
   catch (e) { err(e); }
-}
-async function setMode(m) {
-  if (m === mode) return;
-  if (m === "ai" && !confirm("AI mode: when you ask the local model to investigate an alert, it may EXECUTE that alert's reversible actions itself (block IP, sinkhole, quarantine). It never starts on its own. Continue?")) return;
-  try { await api("/api/mode", {method: "POST", body: JSON.stringify({mode: m})}); err(); refresh(); } catch (e) { err(e); }
 }
 
 function renderStatus(s) {
@@ -131,17 +126,15 @@ function renderStatus(s) {
   st.append(el("span", {class: "chip"}, `last scan ${t(s.last_detection_run)}`));
   st.append(el("span", {class: "chip"}, `behavior: ${s.behavior_monitor}`));
   if (s.detection_error) st.append(el("span", {class: "chip warn"}, "detection error: " + s.detection_error));
-  mode = s.decision && s.decision.mode;
-  $("mode-human").classList.toggle("on", mode === "human");
-  $("mode-ai").classList.toggle("on", mode === "ai");
+  const d = s.decision || {};
+  $("ai-chip").textContent = `Decisions: AI (local model) · ${d.used_last_hour || 0}/${d.max_per_hour || 0} actions this hour`;
 }
 function renderPending(list) {
   $("n-pending").textContent = list.length;
   $("pending").replaceChildren(table(["#", "Action", "Target", "Why", ""], list.map(a => el("tr", {},
     el("td", {}, a.id), el("td", {}, a.type, a.dry_run ? el("div", {class: "muted"}, "dry-run") : null),
     el("td", {class: "wrap"}, a.target), el("td", {class: "wrap muted"}, (a.reason || "").slice(0, 220), el("div", {}, "by " + a.requested_by)),
-    el("td", {}, el("button", {class: "b ok", onclick: () => doAction(a.id, "approve")}, "Approve"), " ",
-                 el("button", {class: "b warn", onclick: () => doAction(a.id, "reject")}, "Reject"))))));
+    el("td", {}, el("button", {class: "b warn", onclick: () => doAction(a.id, "reject")}, "Cancel"))))));
 }
 function renderActive(list) {
   $("n-active").textContent = list.length;
@@ -186,7 +179,7 @@ async function openAlert(id) {
     body.append(table(["#", "Action", "Target", "Status"], (a.actions || []).map(x => el("tr", {}, el("td", {}, x.id), el("td", {}, x.type), el("td", {class: "wrap"}, x.target), el("td", {}, x.status + (x.error ? ": " + x.error : ""))))));
     body.append(el("h2", {style: "margin-top:12px"}, "AI analysis (local model)"));
     if (a.report) body.append(el("pre", {}, a.report));
-    else body.append(el("div", {class: "muted"}, "Not investigated yet. In the llama-server WebUI, ask: ",
+    else body.append(el("div", {class: "muted"}, "Not investigated yet: the AI decides when you ask it. In the llama-server WebUI: ",
       el("code", {}, `Investigate alert ${a.id}`), " ", el("button", {class: "b", onclick: () => navigator.clipboard.writeText(`Investigate alert ${a.id}`)}, "Copy")));
     if (a.resolution) body.append(el("div", {}, `Decision: ${a.resolution} by ${a.resolution_by || "-"} — ${a.resolution_note || ""}`));
     body.append(el("h2", {style: "margin-top:12px"}, "Evidence"));
@@ -210,8 +203,6 @@ async function refreshSsh() {
         el("td", {}, d.known_malicious ? sev("high") : null, d.brute_force ? el("span", {class: "sev medium"}, " brute force") : null)))));
   } catch (e) { $("ssh").textContent = String(e.message || e); }
 }
-$("mode-human").onclick = () => setMode("human");
-$("mode-ai").onclick = () => setMode("ai");
 $("dlg-close").onclick = () => $("dlg").close();
 $("r-go").onclick = async () => {
   const inc = $("r-inc").value, hours = $("r-hours").value || 24;

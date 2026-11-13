@@ -34,7 +34,7 @@ def test_off_by_default_only_records_a_recommendation(agent, backend):  # noqa: 
     assert backend.applied == []
 
 
-def test_execute_runs_reversible_actions_and_leaves_kill_to_a_human(agent, backend):  # noqa: F811
+def test_execute_runs_every_action_of_the_alert_including_kill(agent, backend):  # noqa: F811
     import subprocess
     import sys
 
@@ -42,17 +42,46 @@ def test_execute_runs_reversible_actions_and_leaves_kill_to_a_human(agent, backe
     try:
         alert, ids = make_alert(agent, [("kill_process", {"pid": proc.pid}), ("block_ip", {"ip": "45.1.2.3"})])
         out = auto(agent).resolve(alert, "execute", "Process beacons to a confirmed Feodo C2.")
-        assert out["resolution"] == "partially_executed"
-        assert [h["type"] for h in out["handled"]] == ["block_ip"]
-        assert out["left_for_human"][0]["type"] == "kill_process"
+        assert out["resolution"] == "executed" and out["left_for_human"] == []
+        assert sorted(h["type"] for h in out["handled"]) == ["block_ip", "kill_process"]
         asyncio.run(agent.process_approved())
-        assert agent.db.get_action(ids[1])["status"] == "executed"
-        assert agent.db.get_action(ids[1])["approved_by"] == "qwen-autonomous"
-        assert agent.db.get_action(ids[0])["status"] == "pending"          # kill waits for the analyst
-        assert agent.db.get_alert(alert)["resolution_by"] == "qwen-autonomous"
+        for i in ids:
+            assert agent.db.get_action(i)["status"] == "executed"
+            assert agent.db.get_action(i)["approved_by"] == "qwen-autonomous"
     finally:
         proc.kill()
 
+
+def test_autonomy_actions_still_limits_types(agent):  # noqa: F811
+    alert, ids = make_alert(agent, [("sinkhole_domain", {"domain": "evil.example"})])
+    out = auto(agent, autonomy_actions=("block_ip",)).resolve(alert, "execute", "Domain confirmed malicious.")
+    assert out["left_for_human"][0]["type"] == "sinkhole_domain"
+    assert agent.db.get_action(ids[0])["status"] == "pending"
+
+
+def test_model_requests_are_executed_at_once(agent, backend):  # noqa: F811
+    agent.config.autonomy = True
+    act = call(agent, "agent", "create_action", type="block_ip", params={"ip": "45.1.2.3"}, reason="C2")["data"]
+    assert act["status"] == "approved" and act["approved_by"] == "qwen-autonomous"
+    asyncio.run(agent.process_approved())
+    assert agent.db.get_action(act["id"])["status"] == "executed"
+    rb = call(agent, "agent", "request_rollback", id=act["id"], reason="false positive")["data"]
+    assert rb["status"] == "approved"
+    asyncio.run(agent.process_approved())
+    assert agent.db.get_action(act["id"])["status"] == "rolled_back"
+    # validation and the allowlist still refuse, and the hourly limit leaves the rest pending
+    assert call(agent, "agent", "create_action", type="block_ip", params={"ip": "8.8.8.8"},
+                reason="x")["data"]["status"] == "rejected"
+    agent.config.autonomy_max_per_hour = 0
+    left = call(agent, "agent", "create_action", type="block_ip", params={"ip": "45.1.2.9"}, reason="x")["data"]
+    assert left["status"] == "pending" and "hourly" in left["left_pending"]
+
+
+def test_ai_mode_is_forced_from_the_environment(monkeypatch):
+    from mcp_threatintel.responder.config import ResponderConfig
+    monkeypatch.setenv("AUTONOMY", "off")
+    c = ResponderConfig.from_env()
+    assert c.autonomy is True and "kill_process" in c.autonomy_actions and "lock_user" in c.autonomy_actions
 
 def test_only_the_alerts_own_actions_can_be_approved(agent):  # noqa: F811
     other = agent.manager.create("block_ip", {"ip": "45.1.2.4"}, "created by the model", "mcp-server")

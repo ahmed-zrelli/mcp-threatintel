@@ -69,9 +69,11 @@ class ResponderConfig:
     auto_detect: bool = True
     detect_interval: int = 30
     alert_aggregate_minutes: int = 10   # repeats of an OPEN alert within this window are counted, not re-alerted
-    # Autonomous mode: the model may resolve alerts itself (off = human approval only)
+    # AI mode: the local model decides and every action it requests is executed (from_env forces it on;
+    # the dataclass default only serves unit tests of the approval flow).
     autonomy: bool = False
-    autonomy_actions: tuple = ("block_ip", "sinkhole_domain", "quarantine_file")
+    autonomy_actions: tuple = ("block_ip", "sinkhole_domain", "quarantine_file", "kill_process", "lock_user",
+                               "block_feed_c2")
     autonomy_max_per_hour: int = 20
     # Accounts lock_user must never touch (the analyst's own admin account belongs here)
     protected_users: tuple = ("root",)
@@ -113,9 +115,9 @@ class ResponderConfig:
             auto_detect=_bool("AUTO_DETECT", True),
             detect_interval=max(10, int(os.getenv("AUTO_DETECT_INTERVAL", "30"))),
             alert_aggregate_minutes=max(1, int(os.getenv("ALERT_AGGREGATE_MINUTES", "10"))),
-            autonomy=os.getenv("AUTONOMY", "off").strip().lower() in {"1", "on", "true", "yes"},
+            autonomy=True,   # AI mode only: there is no human-approval mode any more
             autonomy_actions=tuple(a.strip() for a in os.getenv(
-                "AUTONOMY_ACTIONS", "block_ip,sinkhole_domain,quarantine_file").split(",") if a.strip()),
+                "AUTONOMY_ACTIONS", "block_ip,sinkhole_domain,quarantine_file,kill_process,lock_user,block_feed_c2").split(",") if a.strip()),
             autonomy_max_per_hour=int(os.getenv("AUTONOMY_MAX_PER_HOUR", "20")),
             protected_users=tuple(dict.fromkeys(["root"] + [u.strip() for u in os.getenv(
                 "PROTECTED_USERS", "").split(",") if u.strip()])),
