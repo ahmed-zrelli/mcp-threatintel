@@ -11,3 +11,6 @@ docker-compose.override.yml
 # Local runtime
 .venv/
 data/
+
+# Console bundle copied from the server (tokens, agent certificate)
+console/

@@ -75,6 +75,10 @@ class ResponderConfig:
     autonomy_max_per_hour: int = 20
     # Accounts lock_user must never touch (the analyst's own admin account belongs here)
     protected_users: tuple = ("root",)
+    # Network channels (tls:// addresses): the agent's certificate, and who may connect
+    tls_cert: str | None = None
+    tls_key: str | None = None
+    allowed_clients: tuple = ()
 
     @property
     def ttl_seconds_per_unit(self) -> int:
@@ -115,4 +119,7 @@ class ResponderConfig:
             autonomy_max_per_hour=int(os.getenv("AUTONOMY_MAX_PER_HOUR", "20")),
             protected_users=tuple(dict.fromkeys(["root"] + [u.strip() for u in os.getenv(
                 "PROTECTED_USERS", "").split(",") if u.strip()])),
+            tls_cert=os.getenv("TLS_CERT") or None,
+            tls_key=os.getenv("TLS_KEY") or None,
+            allowed_clients=tuple(a.strip() for a in os.getenv("ALLOWED_CLIENTS", "").split(",") if a.strip()),
         )

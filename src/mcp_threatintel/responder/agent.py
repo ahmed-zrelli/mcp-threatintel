@@ -1,12 +1,16 @@
-"""HostAgent (threatintel-responder): the privileged half of mcp-threatintel.
+"""HostAgent (threatintel-responder): the only component on the protected server.
 
-Two listeners, each with a closed list of operations:
+Two channels, each with its own token and a closed list of operations:
 
-* agent channel (AGENT_ADDR, AGENT_TOKEN): used by the unprivileged MCP server.
-  Scans, create an action, read actions, request a rollback. It cannot
-  approve anything.
-* admin channel (ADMIN_ADDR, token file readable by administrators only):
-  used by threatintel-approve. Approve, reject, read the audit log.
+* agent channel (AGENT_ADDR, AGENT_TOKEN): used by the MCP server (Qwen's tools)
+  and the poller on the analyst PC. Scans, create an action, read actions,
+  request a rollback, receive threat intel. It cannot approve anything.
+* admin channel (ADMIN_ADDR, admin token): used by the analyst's dashboard and
+  threatintel-approve. Approve, reject, roll back, decision mode, audit log.
+
+With tls:// addresses both channels are reachable from the analyst PC over
+TLS (pinned certificate) and only from ALLOWED_CLIENTS; a Unix socket can be
+listed too (comma-separated) for local use on the server.
 
 A background loop executes approved actions and expires network blocks.
 """
@@ -15,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hmac
 import logging
 import os
@@ -26,12 +31,13 @@ from .actions import ActionManager, TransitionError
 from .backends import BackendError, CommandRunner, build_backends
 from .backends.nftables import NftablesBackend
 from .config import ResponderConfig
+from .intel_push import IntelReceiver
 from .iocs import IocIndex
 from .alerts import AlertEngine
 from .autonomy import Autonomy
 from .behavior import BehaviorMonitor
 from .monitor import ConnectionSampler, DnsMonitor, FileWatcher
-from .protocol import serve
+from .protocol import serve, split_addrs
 from .scanner import HostScanner
 from .store import ResponderDB, now_iso
 from .validators import Allowlist, ValidationError, discover_allowlist, load_allowlist_file
@@ -41,7 +47,7 @@ logger = logging.getLogger("threatintel.responder")
 AGENT_OPS = {
     "ping", "scan_connections", "scan_files", "scan_auth_logs", "scan_host", "scan_dns", "scan_processes", "list_alerts",
     "investigate_host", "related_iocs", "save_alert_report", "resolve_alert", "list_incidents",
-    "create_action", "get_action", "list_actions", "request_rollback",
+    "create_action", "get_action", "list_actions", "request_rollback", "push_intel", "intel_status",
 }
 ADMIN_OPS = {"ping", "list_actions", "get_action", "approve", "reject", "audit", "list_alerts", "list_incidents"}
 
@@ -80,6 +86,7 @@ class HostAgent:
         self.db.replace_allowlist(entries)
         self.allowlist = Allowlist(self.db.load_allowlist())
         self.iocs = IocIndex(config.ioc_db)
+        self.intel = IntelReceiver(config.ioc_db, self.db)
         self.sampler = ConnectionSampler()
         self.dns = DnsMonitor()
         self.scanner = HostScanner(config, self.iocs, self.sampler, self.dns)
@@ -146,6 +153,13 @@ class HostAgent:
                     "event_alerts": self.detector.event_alerts,
                     "behavior_monitor": {"status": self.behavior.status, "port_scan": self.behavior.portscan.status,
                                          "error": self.behavior.last_error}}
+        if op == "intel_status":
+            return self.intel.status() | {"indicators_indexed": self.iocs.counts}
+        if op == "push_intel":
+            try:
+                return await asyncio.to_thread(self.intel.receive, p)
+            except ValueError as e:
+                raise ValidationError(str(e)) from e
         if op == "scan_connections":
             return await asyncio.to_thread(self.scanner.scan_connections, int(p.get("minutes", 10)))
         if op == "scan_dns":
@@ -365,10 +379,15 @@ class HostAgent:
 
     async def run(self) -> None:
         await asyncio.to_thread(self.prepare_host)
-        agent_srv = await serve(self.config.agent_addr, self.handle_agent, unix_mode=0o660,
-                                unix_group=self.config.agent_socket_group)
-        admin_srv = await serve(self.config.admin_addr, self.handle_admin, unix_mode=0o660,
-                                unix_group=self.config.admin_socket_group)
+        servers = []
+        for addrs, handler, group in ((self.config.agent_addr, self.handle_agent, self.config.agent_socket_group),
+                                      (self.config.admin_addr, self.handle_admin, self.config.admin_socket_group)):
+            for addr in split_addrs(addrs):
+                servers.append(await serve(
+                    addr, handler, unix_mode=0o660, unix_group=group, tls_cert=self.config.tls_cert,
+                    tls_key=self.config.tls_key, allowed_clients=list(self.config.allowed_clients),
+                    on_denied=lambda peer: self.db.append_audit("network", "client_refused", None,
+                                                                peer=str(peer)[:60])))
         self.db.append_audit("responder", "started", None, dry_run=self.config.dry_run,
                              agent_addr=self.config.agent_addr, admin_addr=self.config.admin_addr)
         logger.info("threatintel-responder up: agent=%s admin=%s dry_run=%s allowlist=%d entries",
@@ -383,7 +402,9 @@ class HostAgent:
             self.files.start(self._loop)
             logger.info("detection: event-driven (DNS live, connections every 2 s, files: %s) "
                         "+ full scan every %ds", self.files.status, self.config.detect_interval)
-        async with agent_srv, admin_srv:
+        async with contextlib.AsyncExitStack() as stack:
+            for srv in servers:
+                await stack.enter_async_context(srv)
             while True:
                 try:
                     await self.process_approved()

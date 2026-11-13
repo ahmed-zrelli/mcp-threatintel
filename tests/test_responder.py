@@ -527,7 +527,8 @@ def test_nft_ruleset_template_is_valid_shape():
     text = (Path(__file__).resolve().parent.parent / "deploy" / "threatintel.nft").read_text()
     assert "@MCP_CLIENTS@" in text and "table inet threatintel {" in text
     assert "set blocklist" in text and "flags timeout" in text
-    assert "tcp dport 3707 ip saddr != @mcp_clients" in text
+    assert "tcp dport { 3707, 3712, 3713 } ip saddr != @mcp_clients" in text
+    assert 'log prefix "ti-syn "' in text
 
 
 def test_duplicate_request_reuses_the_pending_action(agent):

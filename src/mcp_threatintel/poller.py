@@ -228,27 +228,57 @@ async def poll_all():
     conn.close()
 
 
+def push_to_agent(force: bool = False) -> None:
+    """Send the indicator database to the host agent (PUSH_AGENT_ADDR / AGENT_TOKEN / AGENT_CA)."""
+    addr = os.getenv("PUSH_AGENT_ADDR") or ""
+    if not addr:
+        return
+    from mcp_threatintel.responder.intel_push import push
+    from mcp_threatintel.responder.protocol import ProtocolError, request_sync
+
+    token = os.getenv("AGENT_TOKEN", "").strip()
+
+    def send(op, params):
+        resp = request_sync(addr, op, params, token, timeout=60)
+        if not resp.get("ok"):
+            raise ProtocolError(resp.get("error") or "agent error")
+        return resp["data"]
+
+    try:
+        result = push(send, DB_PATH, force=force)
+        logger.info("intel push to %s: %s", addr, {k: v for k, v in result.items() if k != "sha256"})
+    except Exception as e:  # the agent may be down; the next cycle retries
+        logger.error("intel push to %s failed: %s", addr, e)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Threat intel feed poller")
     parser.add_argument("--loop", action="store_true", help="Run in continuous loop")
     parser.add_argument("--interval", type=int, default=3600, help="Loop interval in seconds (default: 3600)")
     parser.add_argument("--local-only", action="store_true", help="Only reload lab IOCs from LOCAL_IOCS_FILE, then exit")
+    parser.add_argument("--push-only", action="store_true", help="Only push the current database to the agent")
     args = parser.parse_args()
 
+    if args.push_only:
+        push_to_agent(force=True)
+        return
     if args.local_only:
         conn = init_db(DB_PATH)
         load_local_iocs(conn)
         conn.close()
+        push_to_agent()
         return
 
     if args.loop:
         logger.info("Starting poller loop (interval: %ds)", args.interval)
         while True:
             asyncio.run(poll_all())
+            push_to_agent()
             logger.info("Sleeping %ds until next poll...", args.interval)
             time.sleep(args.interval)
     else:
         asyncio.run(poll_all())
+        push_to_agent()
 
 
 if __name__ == "__main__":

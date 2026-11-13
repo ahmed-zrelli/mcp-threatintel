@@ -17,7 +17,7 @@ table inet threatintel {
 		comment "mcp-threatintel: approved blocks"
 	}
 
-	# Who may reach the MCP server on port 3707: loopback and the analyst PC only.
+	# Who may reach the agent's network channels: loopback and the analyst PC only.
 	set mcp_clients {
 		type ipv4_addr
 		elements = { 127.0.0.1, @MCP_CLIENTS@ }
@@ -29,8 +29,9 @@ table inet threatintel {
 		# Port-scan detection: log each NEW inbound TCP connection attempt (rate limited); the agent
 		# follows the kernel log and counts distinct ports per source.
 		iifname != "lo" tcp flags & (fin|syn|rst|ack) == syn ct state new limit rate 200/second burst 400 packets log prefix "ti-syn " level info comment "port-scan detection"
-		tcp dport 3707 ip saddr != @mcp_clients counter drop comment "MCP server: analyst PC only"
-		meta nfproto ipv6 tcp dport 3707 counter drop comment "MCP server: no IPv6"
+		# Agent channels (TLS 3712 agent, 3713 admin) and the old MCP port: analyst PC only.
+		tcp dport { 3707, 3712, 3713 } ip saddr != @mcp_clients counter drop comment "console ports: analyst PC only"
+		meta nfproto ipv6 tcp dport { 3707, 3712, 3713 } counter drop comment "console ports: no IPv6"
 	}
 
 	chain forward {
