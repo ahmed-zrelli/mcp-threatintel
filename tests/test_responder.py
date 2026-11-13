@@ -384,6 +384,25 @@ def test_quarantine_and_restore(tmp_path):
     assert f.read_bytes() == b"malware bytes"
 
 
+def test_rollback_when_the_same_file_is_already_back(tmp_path):
+    f = tmp_path / "evil.exe"
+    f.write_bytes(b"malware bytes")
+    be = QuarantineBackend(RecordingRunner(), tmp_path / "q")
+    first = be.apply({"id": 1, "params": {"path": str(f)}})
+    f.write_bytes(b"malware bytes")                        # dropped again, quarantined a second time
+    second = be.apply({"id": 2, "params": {"path": str(f)}})
+    be.rollback({"id": 1}, first)                          # the file is back
+    out = be.rollback({"id": 2}, second)                   # same content already there: nothing to do
+    assert out["already_restored"] and f.read_bytes() == b"malware bytes"
+    assert not Path(second["quarantine_path"]).exists()
+    f.write_bytes(b"another file")                         # a DIFFERENT file is never overwritten
+    third = be.apply({"id": 3, "params": {"path": str(f)}})
+    f.write_bytes(b"user data")
+    from mcp_threatintel.responder.backends.base import BackendError
+    with pytest.raises(BackendError, match="different content"):
+        be.rollback({"id": 3}, third)
+
+
 # --- scanner -------------------------------------------------------------------------
 
 

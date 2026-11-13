@@ -71,7 +71,16 @@ class QuarantineBackend(ResponseBackend):
         commands = [f"move {dest} -> {original}"]
         if not self.dry_run:
             if original.exists():
-                raise BackendError(f"{original} exists again; refusing to overwrite it")
+                # The same file is already back (e.g. restored by an earlier rollback of the same file):
+                # nothing to restore, drop the redundant quarantined copy. A different file is never overwritten.
+                if original.is_file() and state.get("sha256") and sha256_file(original) == state["sha256"]:
+                    if dest.exists():
+                        if sys.platform != "win32":
+                            os.chmod(dest, 0o600)
+                        dest.unlink()
+                    commands.append(f"{original} already holds the same file; removed the extra copy {dest}")
+                    return {"restored_to": str(original), "already_restored": True, "commands": commands}
+                raise BackendError(f"{original} exists again with different content; refusing to overwrite it")
             if not dest.exists():
                 raise BackendError(f"{dest} is missing from quarantine")
             if sys.platform != "win32":
