@@ -218,5 +218,25 @@ def test_change_origin_says_who_made_an_account_change():
     root = change_origin(["rootkit"], allowlist=allow, admins=("root", "ahmed"), journal=JOURNAL, logins=LAST)
     (r,) = root["made_by"]
     assert r["user"] is None and not r["known_admin"] and r["via"].startswith("useradd run directly as root")
+    # the analyst deleting the account later is NOT who created it
+    cleanup = JOURNAL + "\n2026-11-13T09:20:25+00:00 devsecops sudo[2900]:    ahmed : TTY=pts/0 ; PWD=/home/ahmed ; USER=root ; COMMAND=/usr/sbin/userdel -r rootkit"
+    again = change_origin(["rootkit"], allowlist=allow, admins=("root", "ahmed"), journal=cleanup, logins=LAST,
+                          tools=("useradd", "adduser"))
+    assert [m["known_admin"] for m in again["made_by"]] == [False]
     none = change_origin(["ghost"], journal=JOURNAL, logins=LAST)
     assert none["made_by"] == [] and "no record" in none["note"]
+
+
+def test_a_recreated_account_gets_a_new_lock(agent):  # noqa: F811
+    from mcp_threatintel.responder import validators
+    import pytest as _pt
+    mp = _pt.MonkeyPatch()
+    mp.setattr(validators, "IS_WINDOWS", True)          # skip the local account lookup
+    try:
+        first = agent.manager.create("lock_user", {"user": "backdoor"}, "x", "auto-detect")
+        agent.manager.approve(first["id"], "rules")
+        agent.manager.transition(first["id"], "executed", "responder")
+        second = agent.manager.create("lock_user", {"user": "backdoor"}, "re-created", "auto-detect")
+        assert second["id"] != first["id"] and not second.get("duplicate")
+    finally:
+        mp.undo()

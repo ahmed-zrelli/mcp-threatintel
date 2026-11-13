@@ -49,11 +49,11 @@ class Forensics:
         self.iocs = scanner.iocs
         self.db = db
 
-    def change_origin(self, terms: list[str]) -> dict:
+    def change_origin(self, terms: list[str], tools: tuple = ()) -> dict:
         from .validators import Allowlist
         cfg = getattr(self.scanner, "config", None)
         return change_origin(terms, allowlist=Allowlist(self.db.load_allowlist()),
-                             admins=tuple(getattr(cfg, "protected_users", ()) or ()))
+                             admins=tuple(getattr(cfg, "protected_users", ()) or ()), tools=tools)
 
     # --- processes ----------------------------------------------------------
 
@@ -277,8 +277,18 @@ def _run(argv: list[str]) -> str:
         return ""
 
 
+#: For each account change, the tools that can make it (a later userdel/cleanup is not who made it).
+CHANGE_TOOLS = {
+    "account_user_added": ("useradd", "adduser"),
+    "account_uid_set_to_0": ("usermod", "vipw"),
+    "account_login_shell_enabled": ("usermod", "chsh"),
+    "account_privileged_group_member_added": ("usermod", "gpasswd", "adduser"),
+    "account_password_changed": ("passwd", "chpasswd", "usermod"),
+}
+
+
 def change_origin(terms: list[str], *, allowlist=None, admins: tuple = (), minutes: int = 30,
-                  journal: str | None = None, logins: str | None = None) -> dict:
+                  journal: str | None = None, logins: str | None = None, tools: tuple = ()) -> dict:
     """Who made an account / system-file change: the matching admin-tool and sudo log lines, the user who
     ran them, and the SSH login (IP) of that terminal. Facts only, from the system log and `last`."""
     terms = [t for t in terms if t]
@@ -290,6 +300,9 @@ def change_origin(terms: list[str], *, allowlist=None, admins: tuple = (), minut
     if logins is None:
         logins = _run(["last", "-i", "-w", "-n", "200"])
     lines = [ln for ln in journal.splitlines() if any(t in ln for t in terms)]
+    if tools:   # only the tools that can make this kind of change
+        lines = [ln for ln in lines if any(f" {tool}[" in ln or f"/{tool} " in ln or ln.rstrip().endswith(f"/{tool}")
+                                           for tool in tools)]
     tty_ip: dict[tuple, str] = {}
     for ln in logins.splitlines():   # "ahmed pts/0 192.168.21.1 Fri Nov 13 08:30 still logged in"
         f = ln.split()
@@ -360,7 +373,7 @@ def collect_evidence(fx: Forensics, kind: str, detail: dict) -> dict:
     elif kind.startswith(("account_", "integrity_")):
         # Who did it, from where: the deciding fact for a change an admin could also have made.
         term = detail.get("user") or detail.get("path")
-        safe("change_origin", fx.change_origin, [term] if term else [])
+        safe("change_origin", fx.change_origin, [term] if term else [], CHANGE_TOOLS.get(kind, ()))
     elif kind in ("new_listener", "suspicious_process", "reverse_shell"):
         if detail.get("pid"):
             safe("process", fx.inspect_process, detail["pid"])
