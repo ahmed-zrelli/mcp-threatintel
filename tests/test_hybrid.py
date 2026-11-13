@@ -32,6 +32,18 @@ def test_rules_execute_clear_cut_attacks(agent):  # noqa: F811
     assert call(agent, "agent", "list_alerts", ai_queue=True)["data"]["ai_queue"] == []      # nothing for the AI
 
 
+def test_rules_act_when_an_open_attack_with_pending_actions_is_seen_again(agent):  # noqa: F811
+    conn = {"remote_ip": "45.1.2.3", "remote_port": 443, "pid": None, "process": "curl"}
+    agent.detector.on_connection(conn)                       # raised while the rules were off
+    (alert,) = _raise(agent, None, None)
+    assert agent.db.get_action(alert["action_ids"][0])["status"] == "pending"
+    agent.detector.rules_execute = True
+    agent.detector.on_connection({**conn, "observed_at": 1e10})   # the connection is still there
+    assert _raise(agent, None, None) == []                   # same open attack: counted, no new alert
+    assert agent.db.get_action(alert["action_ids"][0])["approved_by"] == "rules"
+    assert agent.db.get_alert(alert["id"])["detail"]["route"] == "rules"
+
+
 def test_unclear_behavior_goes_to_the_ai(agent):  # noqa: F811
     agent.detector.rules_execute = True
     (alert,) = _raise(agent, "new_listeners", {"key": "tcp:8771:python3", "port": 8771, "address": "0.0.0.0",

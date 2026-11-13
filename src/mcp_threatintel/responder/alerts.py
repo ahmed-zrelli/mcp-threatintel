@@ -224,6 +224,14 @@ class AlertEngine:
         # 1. Exactly the same finding, still being handled: count it, no new alert.
         if prev and self._is_open(prev):
             self.db.bump_alert(prev["id"])
+            # Still happening and its actions are still pending (raised before the rules could act, or
+            # left pending): the rules act now on a clear-cut attack.
+            pending = [a for a in (self.db.get_action(i) for i in prev["action_ids"]) if a and a["status"] == "pending"]
+            if pending and not prev.get("resolution") and self.rules_execute and finding.kind in RULE_KINDS:
+                route, _ = self._apply_rules(finding, pending)
+                self.db.set_alert_route(prev["id"], route)
+                self.db.append_audit("rules", "acted_on_open_alert", None, alert_id=prev["id"], route=route,
+                                     actions=[a["id"] for a in pending])
             if prev.get("incident_id"):
                 self.db.update_incident(prev["incident_id"])
             return None
