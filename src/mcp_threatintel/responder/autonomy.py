@@ -39,7 +39,8 @@ class Autonomy:
         self.config = config
 
     def status(self) -> dict:
-        return {"enabled": self.config.autonomy, "allowed_actions": list(self.config.autonomy_actions),
+        return {"enabled": self.config.autonomy, "mode": "ai" if self.config.autonomy else "human",
+                "allowed_actions": list(self.config.autonomy_actions),
                 "max_per_hour": self.config.autonomy_max_per_hour,
                 "used_last_hour": self._used_last_hour()}
 

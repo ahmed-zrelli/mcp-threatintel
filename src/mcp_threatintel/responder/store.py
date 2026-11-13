@@ -361,6 +361,32 @@ class ResponderDB:
             out.append(d)
         return out
 
+    # --- reporting (time ranges) ---
+
+    def alerts_since(self, since_iso: str, limit: int = 500) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT id FROM alerts WHERE ts >= ? ORDER BY id LIMIT ?",
+                                      (since_iso, limit)).fetchall()
+        return [self.get_alert(r["id"]) for r in rows]
+
+    def actions_since(self, since_iso: str, limit: int = 500) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM actions WHERE created_at >= ? OR executed_at >= ? ORDER BY id LIMIT ?",
+                (since_iso, since_iso, limit)).fetchall()
+        return [_action(r) for r in rows]
+
+    def audit_since(self, since_iso: str, limit: int = 1000) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM audit_log WHERE ts >= ? ORDER BY id LIMIT ?",
+                                      (since_iso, limit)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["details"] = json.loads(d.pop("details_json") or "{}")
+            out.append(d)
+        return out
+
     # --- settings ---
 
     def get_setting(self, key: str) -> str | None:

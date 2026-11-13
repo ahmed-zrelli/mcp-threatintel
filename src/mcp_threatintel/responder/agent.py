@@ -47,9 +47,10 @@ logger = logging.getLogger("threatintel.responder")
 AGENT_OPS = {
     "ping", "scan_connections", "scan_files", "scan_auth_logs", "scan_host", "scan_dns", "scan_processes", "list_alerts",
     "investigate_host", "related_iocs", "save_alert_report", "resolve_alert", "list_incidents",
-    "create_action", "get_action", "list_actions", "request_rollback", "push_intel", "intel_status",
+    "create_action", "get_action", "list_actions", "request_rollback", "push_intel", "intel_status", "report",
 }
-ADMIN_OPS = {"ping", "list_actions", "get_action", "approve", "reject", "audit", "list_alerts", "list_incidents"}
+ADMIN_OPS = {"ping", "list_actions", "get_action", "approve", "reject", "audit", "list_alerts", "list_incidents",
+             "set_decision_mode", "rollback", "ssh_activity", "report", "overview"}
 
 
 def summarize(action: dict) -> dict:
@@ -94,6 +95,10 @@ class HostAgent:
         self.detector = AlertEngine(self.db, self.manager, self.scanner, interval_s=config.detect_interval,
                                     aggregate_minutes=config.alert_aggregate_minutes)
         self.autonomy = Autonomy(self.db, self.manager, config)
+        # Who decides (human / ai) is switched from the dashboard and persisted; it overrides AUTONOMY.
+        saved = self.db.get_setting("decision_mode")
+        if saved in ("human", "ai"):
+            config.autonomy = saved == "ai"
         # Event-driven detection: collectors report new observables straight to the engine.
         self.sampler.on_new = self.detector.on_connection
         self.dns.on_new = self.detector.on_dns
@@ -203,6 +208,17 @@ class HostAgent:
                 a["report_summary"] = (a.get("report") or "").split("\n")[0][:200] or None
                 a.pop("report", None)
             return alerts
+        if op == "report":
+            from .report import build_report
+            inc = p.get("incident_id")
+            md = await asyncio.to_thread(
+                build_report, self.db, int(inc) if inc else None, int(p.get("hours") or 24),
+                dry_run=self.config.dry_run, decision_mode="ai" if self.config.autonomy else "human")
+            return {"markdown": md}
+        if op == "ssh_activity":
+            return await asyncio.to_thread(self.scanner.scan_auth_logs, int(p.get("minutes") or 15))
+        if op == "overview":
+            return await asyncio.to_thread(self._overview)
         if op == "list_incidents":
             incs = self.db.list_incidents(max(1, min(int(p.get("limit", 20)), 100)))
             for inc in incs:
@@ -261,6 +277,20 @@ class HostAgent:
             action = self.manager.request_rollback(int(p.get("id", 0)), str(p.get("reason") or ""), "mcp-server")
             return summarize(action)
         actor = f"analyst:{str(p.get('actor') or 'unknown')[:64]}"
+        if op == "set_decision_mode":
+            mode = str(p.get("mode") or "")
+            if mode not in ("human", "ai"):
+                raise ValidationError("mode must be human or ai")
+            self.config.autonomy = mode == "ai"
+            self.db.set_setting("decision_mode", mode, actor)
+            self.db.append_audit(actor, "decision_mode", None, mode=mode)
+            return self.autonomy.status()
+        if op == "rollback":  # the analyst undoes an executed action: request + approve in one step
+            rb = self.manager.request_rollback(int(p.get("id", 0)), str(p.get("reason") or "rolled back by analyst"),
+                                               actor)
+            action = await asyncio.to_thread(self.manager.approve, rb["id"], actor)
+            self._wake.set()
+            return summarize(action)
         if op == "approve":
             action = await asyncio.to_thread(self.manager.approve, int(p.get("id", 0)), actor)
             self._wake.set()
@@ -272,6 +302,33 @@ class HostAgent:
             return self.db.audit(int(action_id) if action_id is not None else None,
                                  limit=max(1, min(int(p.get("limit", 50)), 500)))
         raise TransitionError(f"unknown operation {op!r}")
+
+    def _overview(self) -> dict:
+        """Everything the dashboard shows, in one admin call."""
+        incidents = self.db.list_incidents(15)
+        for inc in incidents:
+            inc.pop("keys", None)
+            inc["open"] = self.detector._incident_open(inc)
+        alerts = self.db.list_alerts(0, 30)
+        for a in alerts:
+            a["actions"] = [summarize(x) for x in (self.db.get_action(i) for i in a["action_ids"]) if x]
+            a["detail"].pop("actions", None)
+            a["detail"].pop("evidence", None)
+        behavior = self.behavior.report(60)
+        return {
+            "status": {"dry_run": self.config.dry_run, "platform": sys.platform,
+                       "decision": self.autonomy.status(), "auto_detect": self.config.auto_detect,
+                       "last_detection_run": self.detector.last_run, "detection_error": self.detector.last_error,
+                       "dns_monitor": self.dns.status, "file_watcher": self.files.status,
+                       "behavior_monitor": self.behavior.status, "port_scan_monitor": self.behavior.portscan.status,
+                       "indicators_indexed": self.iocs.counts, "intel": self.intel.status()},
+            "pending": [summarize(a) for a in self.db.list_actions("pending", 100)],
+            "active": [summarize(a) for a in self.db.list_actions("executed", 200) if a["type"] != "rollback"],
+            "incidents": incidents,
+            "alerts": list(reversed(alerts)),
+            "port_scans": behavior["port_scans"][-20:],
+            "audit": self.db.audit(limit=40),
+        }
 
     # --- execution loop -----------------------------------------------------
 

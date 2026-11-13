@@ -5,6 +5,9 @@
     threatintel-approve approve <id>
     threatintel-approve reject <id> [--reason TEXT]
     threatintel-approve audit [--id N] [--limit N]
+    threatintel-approve rollback <id> [--reason TEXT]
+    threatintel-approve mode [human|ai]
+    threatintel-approve report [--incident N] [--hours H] [--out FILE]
 
 Needs read access to the admin token file, i.e. an elevated terminal.
 """
@@ -82,6 +85,15 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("alert", help="one alert in full: evidence and investigation report").add_argument("id", type=int)
     p = sub.add_parser("incidents", help="attacks: each incident groups the alerts of one attack")
     p.add_argument("--limit", type=int, default=15)
+    p = sub.add_parser("rollback", help="undo an executed (reversible) action")
+    p.add_argument("id", type=int)
+    p.add_argument("--reason", default="")
+    p = sub.add_parser("mode", help="show or set who decides: human (approval) or ai (model may execute)")
+    p.add_argument("mode", nargs="?", choices=["human", "ai"])
+    p = sub.add_parser("report", help="incident report (Markdown): facts + labelled AI analysis")
+    p.add_argument("--incident", type=int)
+    p.add_argument("--hours", type=int, default=24)
+    p.add_argument("--out", help="write to this file instead of the screen")
     p = sub.add_parser("audit", help="show the audit log")
     p.add_argument("--id", type=int)
     p.add_argument("--limit", type=int, default=30)
@@ -148,6 +160,24 @@ def main(argv: list[str] | None = None) -> None:
         print(f"\n  REPORT ({a.get('report_by') or '-'}, {a.get('report_at') or 'not written yet'}):")
         for line in (a.get("report") or "(none yet: the PC notifier writes it)").splitlines():
             print(f"    {line}")
+    elif args.cmd == "rollback":
+        a = _call(config, "rollback", id=args.id, actor=actor, reason=args.reason or "rolled back by analyst")
+        print(f"rollback #{a['id']} of action {args.id}: {a['status']}")
+    elif args.cmd == "mode":
+        if args.mode:
+            s = _call(config, "set_decision_mode", mode=args.mode, actor=actor)
+        else:
+            s = _call(config, "ping")["autonomy"]
+        print(f"decision mode: {s['mode']}  (AI may execute: {', '.join(s['allowed_actions'])}; "
+              f"{s['used_last_hour']}/{s['max_per_hour']} used in the last hour)")
+    elif args.cmd == "report":
+        md = _call(config, "report", incident_id=args.incident, hours=args.hours)["markdown"]
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as f:
+                f.write(md)
+            print(f"report written to {args.out}")
+        else:
+            print(md)
     elif args.cmd == "audit":
         for e in _call(config, "audit", id=args.id, limit=args.limit):
             print(f"{e['ts']}  #{e['action_id'] or '-':<5} {e['actor']:<22} {e['event']:<20} "

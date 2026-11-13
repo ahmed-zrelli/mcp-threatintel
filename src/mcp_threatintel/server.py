@@ -466,6 +466,21 @@ async def resolve_alert(alert_id: int, decision: str, justification: str) -> str
     return await _agent_call("resolve_alert", alert_id=alert_id, decision=decision, justification=justification)
 
 
+@mcp.tool(annotations=HOST_READ)
+async def incident_report(incident_id: int = 0, hours: int = 24) -> str:
+    """Factual incident report (Markdown) built from the server's records: timeline, findings, actions and
+    outcome, recommended follow-up, and the saved AI analyses (labelled as such).
+
+    Args:
+        incident_id: One incident (0 = every alert of the period).
+        hours: Period when incident_id is 0 (default 24).
+    """
+    try:
+        return (await _agent.call("report", incident_id=incident_id or None, hours=hours))["markdown"]
+    except AgentError as e:
+        return _format({"error": str(e)})
+
+
 @mcp.tool(annotations=GOVERN)
 async def save_alert_report(alert_id: int, report: str) -> str:
     """Store the investigation report of an alert on the server (text only, changes nothing on the host).
