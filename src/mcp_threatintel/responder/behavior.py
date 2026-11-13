@@ -284,6 +284,18 @@ def diff_accounts(old: dict, new: dict) -> list[dict]:
     return changes
 
 
+def package_like_account_change(c: dict, snapshot: dict) -> bool:
+    """What a package installation does to accounts: system accounts (uid < 1000) without a login
+    shell, created, removed or re-passworded. Never a login user, a privileged group member, uid 0,
+    a sudo rule or an SSH key — those stay at full severity even while apt runs."""
+    if c["change"] not in ("user_added", "user_removed", "password_changed"):
+        return False
+    u = snapshot.get("users", {}).get(c.get("user"), {})
+    if c["change"] == "user_removed":
+        return True
+    return 0 < u.get("uid", 1000) < 1000 and u.get("shell", "").endswith(NO_LOGIN)
+
+
 def _lines(path: Path) -> list[str]:
     try:
         return path.read_text(errors="replace").splitlines()
@@ -470,7 +482,7 @@ class BehaviorMonitor:
         changes = diff_accounts(old, new)
         pkg = self._pkg() if changes else False
         for c in changes:
-            if pkg and c["change"] != "ssh_key_added":
+            if pkg and package_like_account_change(c, new):
                 c.update(severity="low", during_package_install=True)
             self.emit("account_changes", c)
         return changes

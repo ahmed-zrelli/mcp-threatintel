@@ -173,6 +173,15 @@ def test_package_installation_lowers_severity(tmp_path, monkeypatch):
     assert c["severity"] == "low" and c["during_package_install"]
     (f,) = extract_findings({"behavior": {"account_changes": [c]}})
     assert f.plan == []                                                      # nothing proposed
+    # an attacker hiding behind a running apt: a login user with sudo stays HIGH / CRITICAL
+    with open(root / "etc" / "passwd", "a") as f:
+        f.write("labuser2:x:1001:1001::/home/labuser2:/bin/bash\n")
+    (root / "etc" / "group").write_text(GROUP.replace("sudo:x:27:ahmed", "sudo:x:27:ahmed,labuser2"))
+    got = {c["change"]: c for c in m.check_accounts()}
+    assert got["user_added"]["severity"] == "high" and "during_package_install" not in got["user_added"]
+    assert got["privileged_group_member_added"]["severity"] == "critical"
+    plans = [f.plan for f in extract_findings({"behavior": {"account_changes": list(got.values())}})]
+    assert all(p and p[0][0] == "lock_user" for p in plans)
 
 
 def test_idle_unattended_upgrade_helper_is_not_a_package_install():
