@@ -13,4 +13,4 @@ docker-compose.override.yml
 data/
 
 # Console bundle copied from the server (tokens, agent certificate)
-console/
+/console/
