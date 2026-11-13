@@ -75,6 +75,14 @@ CREATE TABLE IF NOT EXISTS incidents (
     persisting_notified INTEGER NOT NULL DEFAULT 0
 );
 
+-- Runtime settings and baselines (decision mode, normal accounts/files/ports), kept across restarts.
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    changed_by TEXT,
+    changed_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS allowlist (
     value TEXT NOT NULL,
     type TEXT NOT NULL,
@@ -352,6 +360,21 @@ class ResponderDB:
             d["action_ids"] = json.loads(d["action_ids"] or "[]")
             out.append(d)
         return out
+
+    # --- settings ---
+
+    def get_setting(self, key: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_setting(self, key: str, value: str, by: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO settings (key, value, changed_by, changed_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, changed_by = excluded.changed_by, "
+                "changed_at = excluded.changed_at", (key, value, by, now_iso()))
+            self._conn.commit()
 
     # --- allowlist ---
 

@@ -73,6 +73,8 @@ class ResponderConfig:
     autonomy: bool = False
     autonomy_actions: tuple = ("block_ip", "sinkhole_domain", "quarantine_file")
     autonomy_max_per_hour: int = 20
+    # Accounts lock_user must never touch (the analyst's own admin account belongs here)
+    protected_users: tuple = ("root",)
 
     @property
     def ttl_seconds_per_unit(self) -> int:
@@ -111,4 +113,6 @@ class ResponderConfig:
             autonomy_actions=tuple(a.strip() for a in os.getenv(
                 "AUTONOMY_ACTIONS", "block_ip,sinkhole_domain,quarantine_file").split(",") if a.strip()),
             autonomy_max_per_hour=int(os.getenv("AUTONOMY_MAX_PER_HOUR", "20")),
+            protected_users=tuple(dict.fromkeys(["root"] + [u.strip() for u in os.getenv(
+                "PROTECTED_USERS", "").split(",") if u.strip()])),
         )

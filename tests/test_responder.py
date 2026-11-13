@@ -110,7 +110,7 @@ def backend():
 
 @pytest.fixture
 def agent(config, backend):
-    types = ["block_ip", "block_feed_c2", "sinkhole_domain", "quarantine_file", "kill_process"]
+    types = ["block_ip", "block_feed_c2", "sinkhole_domain", "quarantine_file", "kill_process", "lock_user"]
     fake = {t: backend for t in types}
     a = HostAgent(config, admin_token=ADMIN_TOKEN, discover=False, backends={True: fake, False: fake})
     a.allowlist.add("8.8.8.8", "ip", "DNS server")

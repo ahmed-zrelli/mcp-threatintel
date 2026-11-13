@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from .behavior import PERSISTENCE_DIRS
 
 from .config import ResponderConfig
 from .iocs import IocIndex
@@ -23,6 +26,7 @@ from .validators import (
     validate_file,
     validate_ip,
     validate_pid,
+    validate_user,
 )
 
 logger = logging.getLogger("threatintel.responder.actions")
@@ -37,8 +41,9 @@ TRANSITIONS: dict[str, set[str]] = {
     "expired": set(),
 }
 
-ACTION_TYPES = {"block_ip", "sinkhole_domain", "quarantine_file", "kill_process", "block_feed_c2", "rollback"}
-REVERSIBLE = {"block_ip", "sinkhole_domain", "quarantine_file", "block_feed_c2"}
+ACTION_TYPES = {"block_ip", "sinkhole_domain", "quarantine_file", "kill_process", "block_feed_c2", "lock_user",
+                "rollback"}
+REVERSIBLE = {"block_ip", "sinkhole_domain", "quarantine_file", "block_feed_c2", "lock_user"}
 EXPIRING = {"block_ip", "block_feed_c2"}
 FEEDS_FOR_C2 = {"feodo", "threatfox"}
 
@@ -60,17 +65,27 @@ class ActionManager:
         """Return (target, normalised params) or raise ValidationError."""
         if type_ == "block_ip":
             raw = str(params.get("ip", "")).strip()
-            ip = validate_ip(raw, allow_private=self.iocs.is_local_ioc(raw))
+            # A LAN address may be blocked when it is a lab IOC, or when the agent itself saw it attack
+            # (port scan, reverse shell): "behavior" is only kept on actions created by the detection.
+            behavior = bool(params.get("behavior"))
+            ip = validate_ip(raw, allow_private=behavior or self.iocs.is_local_ioc(raw))
             self._deny(self.allowlist.check_ip(ip))
             ttl = self._ttl(params.get("ttl"))
-            return ip, {"ip": ip, "ttl": ttl}
+            return ip, {"ip": ip, "ttl": ttl} | ({"behavior": True} if behavior else {})
         if type_ == "sinkhole_domain":
             domain = validate_domain(params.get("domain", ""))
             self._deny(self.allowlist.check_domain(domain))
             return domain, {"domain": domain}
         if type_ == "quarantine_file":
-            path = validate_file(params.get("path", ""), self.config.scan_paths)
-            return str(path), {"path": str(path)}
+            # New persistence files (cron, systemd units, ld.so.preload...) found by the integrity
+            # monitor may be quarantined too; any other path must be inside SCAN_PATHS.
+            behavior = bool(params.get("behavior"))
+            roots = self.config.scan_paths + ([Path(p) for p in PERSISTENCE_DIRS] if behavior else [])
+            path = validate_file(params.get("path", ""), roots)
+            return str(path), {"path": str(path)} | ({"behavior": True} if behavior else {})
+        if type_ == "lock_user":
+            user = validate_user(params.get("user", ""), protected=self.config.protected_users)
+            return user, {"user": user}
         if type_ == "kill_process":
             info = validate_pid(params.get("pid"), protected=self.allowlist.protected_processes)
             self._deny(self.allowlist.check_process(info["name"]))
@@ -113,6 +128,8 @@ class ActionManager:
     def create(self, type_: str, params: dict, reason: str, requested_by: str) -> dict:
         if type_ not in ACTION_TYPES - {"rollback"}:
             raise ValidationError(f"unknown action type {type_!r}")
+        if requested_by != "auto-detect":
+            params = {k: v for k, v in params.items() if k != "behavior"}
         try:
             target, clean = self.validate(type_, params)
             status, result = "pending", None
@@ -123,7 +140,7 @@ class ActionManager:
                 return {**existing, "duplicate": True}
         except ValidationError as e:
             target = str(params.get("ip") or params.get("domain") or params.get("path")
-                         or params.get("pid") or params.get("feed") or "?")
+                         or params.get("pid") or params.get("feed") or params.get("user") or "?")
             clean, status, result = params, "rejected", {"error": str(e)}
         action_id = self.db.insert_action(
             type=type_, target=target, params=clean, reason=reason[:500], requested_by=requested_by,

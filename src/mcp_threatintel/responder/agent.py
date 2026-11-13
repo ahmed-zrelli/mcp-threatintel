@@ -29,6 +29,7 @@ from .config import ResponderConfig
 from .iocs import IocIndex
 from .alerts import AlertEngine
 from .autonomy import Autonomy
+from .behavior import BehaviorMonitor
 from .monitor import ConnectionSampler, DnsMonitor, FileWatcher
 from .protocol import serve
 from .scanner import HostScanner
@@ -90,6 +91,10 @@ class HostAgent:
         self.sampler.on_new = self.detector.on_connection
         self.dns.on_new = self.detector.on_dns
         self.files = FileWatcher(config.scan_paths, self.detector.on_file)
+        # Behavior detection (no feed needed): port scans, reverse shells, listeners, accounts, system files.
+        self.behavior = BehaviorMonitor(self.db, self.allowlist)
+        self.behavior.on_event = self.detector.on_behavior
+        self.scanner.behavior = self.behavior
         self.detector.on_alert = self._alert_raised
         self._loop: asyncio.AbstractEventLoop | None = None
         self._new_alert = asyncio.Event()
@@ -138,7 +143,9 @@ class HostAgent:
                     "auto_detect": self.config.auto_detect, "detect_interval_s": self.config.detect_interval,
                     "last_detection_run": self.detector.last_run, "detection_error": self.detector.last_error,
                     "autonomy": self.autonomy.status(), "file_watcher": self.files.status,
-                    "event_alerts": self.detector.event_alerts}
+                    "event_alerts": self.detector.event_alerts,
+                    "behavior_monitor": {"status": self.behavior.status, "port_scan": self.behavior.portscan.status,
+                                         "error": self.behavior.last_error}}
         if op == "scan_connections":
             return await asyncio.to_thread(self.scanner.scan_connections, int(p.get("minutes", 10)))
         if op == "scan_dns":
@@ -372,6 +379,7 @@ class HostAgent:
         if self.config.auto_detect:
             self._collectors.append(asyncio.create_task(self.detector.run()))
             self._collectors.append(asyncio.create_task(self.detector.run_events()))
+            self._collectors.append(asyncio.create_task(self.behavior.run()))
             self.files.start(self._loop)
             logger.info("detection: event-driven (DNS live, connections every 2 s, files: %s) "
                         "+ full scan every %ds", self.files.status, self.config.detect_interval)

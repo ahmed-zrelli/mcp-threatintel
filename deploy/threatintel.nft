@@ -26,6 +26,9 @@ table inet threatintel {
 	chain input {
 		type filter hook input priority -10; policy accept;
 		ip saddr @blocklist counter drop comment "approved block"
+		# Port-scan detection: log each NEW inbound TCP connection attempt (rate limited); the agent
+		# follows the kernel log and counts distinct ports per source.
+		iifname != "lo" tcp flags & (fin|syn|rst|ack) == syn ct state new limit rate 200/second burst 400 packets log prefix "ti-syn " level info comment "port-scan detection"
 		tcp dport 3707 ip saddr != @mcp_clients counter drop comment "MCP server: analyst PC only"
 		meta nfproto ipv6 tcp dport 3707 counter drop comment "MCP server: no IPv6"
 	}

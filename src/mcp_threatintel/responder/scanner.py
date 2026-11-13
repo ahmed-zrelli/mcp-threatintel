@@ -132,6 +132,7 @@ class HostScanner:
         self.sampler = sampler
         self.dns = dns
         self._hash_cache: dict[str, tuple[int, float, dict]] = {}
+        self.behavior = None  # BehaviorMonitor, set by the agent
 
     def _cap(self, hits: list) -> dict:
         return {"malicious_count": len(hits), "malicious": hits[: self.config.max_results],
@@ -322,6 +323,15 @@ class HostScanner:
             suggestions.append(f"kill_process pid={p['pid']} ({p['process']}: {p['indicators'][0]['value']})")
         for ip in report["auth_logs"].get("brute_force_ips", []) + report["auth_logs"].get("malicious_sources", []):
             suggestions.append(f"block_ip ip={ip} (SSH)")
+        if self.behavior is not None:
+            # Attacks found by behavior, not by feeds: port scans, reverse shells, new listeners,
+            # account and system-file changes.
+            report["behavior"] = self.behavior.report(minutes)
+            from .findings import extract_findings
+            for f in extract_findings({"behavior": report["behavior"]}):
+                for tool, args in f.plan:
+                    value = next(v for k, v in args.items() if k not in ("reason", "behavior"))
+                    suggestions.append(f"{tool} {value} ({f.title[:80]})")
         report["suggested_actions"] = list(dict.fromkeys(suggestions))[: self.config.max_results]
         report["findings"] = len(set(suggestions))
         report["indicators_indexed"] = self.iocs.counts

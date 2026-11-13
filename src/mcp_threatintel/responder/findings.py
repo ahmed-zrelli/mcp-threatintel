@@ -115,8 +115,94 @@ def extract_findings(report: dict) -> list[Finding]:
                   f"(users: {users})" + (f", IOC: {_source(d.get('ioc_matches'))}" if d.get("known_malicious") else ""))
         out.append(Finding(kind, f"{kind}:{ip}", title, d, sev, [("block_ip", {"ip": ip, "reason": reason})]))
 
+    out += behavior_findings(report.get("behavior") or {})
     out.sort(key=lambda f: SEVERITY_ORDER.get(f.severity, 9))
     return out
+
+
+ACCOUNT_TITLES = {
+    "user_added": "New account created: {user} (uid {uid}, shell {shell})",
+    "uid_set_to_0": "Account {user} now has uid 0 (root privileges)",
+    "login_shell_enabled": "Login shell enabled for system account {user} ({shell})",
+    "user_removed": "Account removed: {user}",
+    "privileged_group_member_added": "{user} added to privileged group {group}",
+    "password_changed": "Password changed for {user}",
+    "sudoers_added": "New sudoers file: {path}",
+    "sudoers_modified": "sudoers changed: {path}",
+    "ssh_key_added": "SSH key added to {user}'s authorized_keys ({key})",
+}
+LOCK_ON = {"user_added", "uid_set_to_0", "login_shell_enabled", "privileged_group_member_added", "ssh_key_added"}
+
+
+def behavior_findings(b: dict) -> list[Finding]:
+    """Attacks found by behavior rather than by a feed (see responder/behavior.py)."""
+    out: list[Finding] = []
+    for s in b.get("port_scans") or []:
+        ip = s["src_ip"]
+        reason = f"{ip} probed {s['distinct_ports']} different ports in {s['window_s']:.0f} s"
+        allow = s.get("allowlisted")
+        f = Finding("port_scan", f"portscan:{ip}",
+                    f"Port scan from {ip}: {s['distinct_ports']} ports in {s['window_s']:.0f} s"
+                    + (" (allowlisted source, not blocked)" if allow else ""), s, "medium" if allow else "high")
+        if not allow:
+            f.plan.append(("block_ip", {"ip": ip, "behavior": True, "reason": reason}))
+        out.append(f)
+
+    for r in b.get("reverse_shells") or []:
+        pid, name, ip = r["pid"], r.get("process") or "?", r["remote_ip"]
+        reason = f"{name} (PID {pid}) has its input/output connected to {ip}:{r['remote_port']} (reverse shell)"
+        out.append(Finding("reverse_shell", f"revshell:{pid}",
+                           f"REVERSE SHELL: {name} (PID {pid}, user {r.get('user')}) -> {ip}:{r['remote_port']}",
+                           r, "critical", [("kill_process", {"pid": int(pid), "reason": reason}),
+                                           ("block_ip", {"ip": ip, "behavior": True, "reason": reason})]))
+
+    for p in b.get("suspicious_processes") or []:
+        pid, name = p["pid"], p.get("process") or "?"
+        why = "; ".join(p.get("reasons") or [])
+        out.append(Finding("suspicious_process", f"susproc:{pid}",
+                           f"Suspicious process: {name} (PID {pid}, user {p.get('user')}): {why}",
+                           p, "high", [("kill_process", {"pid": int(pid), "reason": f"{name} (PID {pid}): {why}; "
+                                                         f"command: {p.get('cmdline', '')[:150]}"})]))
+
+    for n in b.get("new_listeners") or []:
+        title = (f"New listening port {n['address']}:{n['port']} opened by {n['process']} (PID {n['pid']})"
+                 + (" during a package installation" if n.get("during_package_install") else ""))
+        f = Finding("new_listener", f"listen:{n['key']}", title, n, n.get("severity", "high"))
+        if n.get("pid") and not n.get("during_package_install") and n["severity"] != "medium":
+            f.plan.append(("kill_process", {"pid": int(n["pid"]), "reason": f"{title}; not in the baseline of "
+                                            f"known listening services (backdoor / bind shell?)"}))
+        out.append(f)
+
+    for c in b.get("account_changes") or []:
+        title = ACCOUNT_TITLES.get(c["change"], c["change"]).format_map(_Default(c))
+        if c.get("during_package_install"):
+            title += " (during a package installation)"
+        ident = c.get("fingerprint") or c.get("group") or c.get("path") or ""
+        f = Finding(f"account_{c['change']}", f"account:{c['change']}:{c.get('user') or ''}:{ident}",
+                    title, c, c.get("severity", "high"))
+        if c["change"] in LOCK_ON and c.get("user") and not c.get("during_package_install"):
+            f.plan.append(("lock_user", {"user": c["user"], "reason": title}))
+        out.append(f)
+
+    for c in b.get("integrity_changes") or []:
+        what = "created" if c["change"] == "file_added" else "modified"
+        title = f"System file {what}: {c['path']}" + (" (persistence location)" if c.get("persistence") else "")
+        if c.get("during_package_install"):
+            title += " during a package installation"
+        f = Finding("integrity_" + c["change"], f"integrity:{c['path']}:{c['sha256'][:16]}", title, c,
+                    c.get("severity", "medium"))
+        if (c.get("persistence") and (c["change"] == "file_added" or c["path"] == "/etc/ld.so.preload")
+                and not c.get("during_package_install")):
+            added = "; ".join(c.get("added_lines") or [])[:200]
+            f.plan.append(("quarantine_file", {"path": c["path"], "behavior": True,
+                                               "reason": f"{title}; content: {added or '(binary)'}"}))
+        out.append(f)
+    return out
+
+
+class _Default(dict):
+    def __missing__(self, key):
+        return "?"
 
 
 class SeenStore:

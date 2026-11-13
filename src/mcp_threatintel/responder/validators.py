@@ -24,6 +24,7 @@ logger = logging.getLogger("threatintel.responder.validators")
 
 IS_WINDOWS = sys.platform == "win32"
 
+_USER_RE = re.compile(r"^[a-z_][a-z0-9_.-]{0,31}\$?$", re.I)
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:(?!-)[a-z0-9-]{1,63}(?<!-)\.)+[a-z][a-z0-9-]{0,62}$")
 
 #: Processes that must never be killed, whatever the model asks.
@@ -108,6 +109,22 @@ def validate_file(value: str, scan_paths: list[Path]) -> Path:
     if not path.is_file():
         raise ValidationError(f"not a regular file: {path}")
     return path
+
+
+def validate_user(value: str, *, protected: tuple | set = ("root",)) -> str:
+    """A local account that exists and is not protected (root, the analyst's account)."""
+    user = str(value or "").strip()
+    if not _USER_RE.match(user):
+        raise ValidationError(f"not a valid user name: {value!r}")
+    if user.lower() in {p.lower() for p in protected}:
+        raise ValidationError(f"{user} is a protected account; refusing to lock it")
+    if not IS_WINDOWS:
+        import pwd
+        try:
+            pwd.getpwnam(user)
+        except KeyError:
+            raise ValidationError(f"no local user {user!r}") from None
+    return user
 
 
 def validate_pid(value, *, protected: set[str] | None = None) -> dict:

@@ -78,6 +78,8 @@ BLOCK_TTL_UNIT=hours
 AUTH_FAIL_THRESHOLD=5
 EOF
 fi
+# lock_user must never lock the analyst out (added to existing installs too)
+grep -q '^PROTECTED_USERS=' "$ETC/responder.env" || echo "PROTECTED_USERS=root,$LAB_USER" >> "$ETC/responder.env"
 chown root:root "$ETC/responder.env"; chmod 0600 "$ETC/responder.env"
 AGENT_TOKEN="$(grep -E '^AGENT_TOKEN=' "$ETC/responder.env" | cut -d= -f2-)"
 

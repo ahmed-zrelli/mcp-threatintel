@@ -46,6 +46,9 @@ def finding_keys(finding: Finding) -> set[str]:
             keys.add(f"{prefix}:{str(value).lower()}")
 
     add("ip", d.get("remote_ip") or (d.get("ip") if finding.kind.startswith("ssh_") else None))
+    add("ip", d.get("src_ip"))
+    add("user", d.get("user") if finding.kind.startswith(("account_", "ssh_")) else None)
+    add("port", d.get("port") if finding.kind == "new_listener" else None)
     add("pid", d.get("pid"))
     add("domain", d.get("domain"))
     for ip in d.get("answers") or []:
@@ -66,6 +69,7 @@ def finding_keys(finding: Finding) -> set[str]:
 
 ACTION_PARAM = {  # MCP tool argument -> action parameter
     "block_ip": "ip", "kill_process": "pid", "quarantine_file": "path", "sinkhole_domain": "domain",
+    "lock_user": "user",
 }
 
 
@@ -107,6 +111,9 @@ class AlertEngine:
                                                             "answers": rec.get("answers", []),
                                                             "ioc_matches": matches}]}}))
 
+    def on_behavior(self, section: str, rec: dict) -> None:
+        self._submit(("report", {"behavior": {section: [rec]}}))
+
     def on_file(self, path: str) -> None:
         self._submit(("file", path))  # hashing happens in the worker, not in the event loop
 
@@ -131,8 +138,9 @@ class AlertEngine:
 
     def _create(self, tool: str, args: dict) -> dict:
         key = ACTION_PARAM[tool]
+        params = {key: args[key]} | ({"behavior": True} if args.get("behavior") else {})
         try:
-            return self.manager.create(tool, {key: args[key]}, args.get("reason", ""), "auto-detect")
+            return self.manager.create(tool, params, args.get("reason", ""), "auto-detect")
         except ValidationError as e:
             return {"id": None, "type": tool, "status": "rejected", "error": str(e)}
 

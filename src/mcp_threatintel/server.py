@@ -528,6 +528,17 @@ async def kill_process(pid: int, reason: str) -> str:
 
 
 @mcp.tool(annotations=ACTION)
+async def lock_user(user: str, reason: str) -> str:
+    """Request locking a local account (password and SSH keys refused, reversible). Needs analyst approval.
+
+    Args:
+        user: Account name, e.g. a user created by an attacker.
+        reason: Evidence, e.g. the account change alert.
+    """
+    return await _create("lock_user", {"user": user}, reason)
+
+
+@mcp.tool(annotations=ACTION)
 async def block_feed_c2(feed: str = "feodo", reason: str = "", ttl_hours: float = 24) -> str:
     """Request blocking every C2 IP of a feed in one action. Needs analyst approval.
 

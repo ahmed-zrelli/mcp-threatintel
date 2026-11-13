@@ -10,6 +10,7 @@ from .hosts_file import HostsFileBackend
 from .nftables import NftablesBackend
 from .process import ProcessBackend
 from .quarantine import QuarantineBackend
+from .users import UserBackend
 from .windows_firewall import WindowsFirewallBackend
 
 __all__ = ["BackendError", "CommandRunner", "ResponseBackend", "build_backends"]
@@ -27,4 +28,5 @@ def build_backends(config: ResponderConfig, runner: CommandRunner | None = None)
         "sinkhole_domain": HostsFileBackend(runner, config.hosts_path, config.data_dir / "backup"),
         "quarantine_file": QuarantineBackend(runner, config.quarantine_dir),
         "kill_process": ProcessBackend(runner),
+        "lock_user": UserBackend(runner),
     }
