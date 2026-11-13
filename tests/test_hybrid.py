@@ -140,3 +140,50 @@ def test_responder_waits_for_qwen_then_escalates_if_it_cannot_decide(monkeypatch
     resolved = [a for n, a in mcp.calls if n == "resolve_alert"]
     assert resolved and resolved[-1]["decision"] == "escalate"
     assert AGENT_TOKEN
+
+
+def test_model_that_forgets_to_decide_is_asked_once():
+    import httpx
+
+    from mcp_threatintel.watch.llm import investigate
+
+    class MCP:
+        def __init__(self):
+            self.calls = []
+
+        async def list_tools(self):
+            return [SimpleNamespace(name="resolve_alert", description="decide", inputSchema={"type": "object"})]
+
+        async def call_tool(self, name, args):
+            self.calls.append((name, args))
+            return SimpleNamespace(content=[SimpleNamespace(text=json.dumps({"resolution": "executed"}))])
+
+    replies = iter([
+        {"content": "VERDICT: true positive - high"},                                     # forgot to decide
+        {"tool_calls": [{"id": "r", "function": {"name": "resolve_alert",
+                                                 "arguments": '{"alert_id": 21, "decision": "execute", '
+                                                              '"justification": "Confirmed C2."}'}}]},
+        {"content": "DECISION: executed"},
+    ])
+    sent = []
+
+    def handler(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", **next(replies)}}]})
+
+    mcp = MCP()
+    report, _ = asyncio.run(investigate(mcp, "http://llm", "alert", decide_alert=21,
+                                        transport=httpx.MockTransport(handler)))
+    assert [c[0] for c in mcp.calls] == ["resolve_alert"]
+    assert "resolve_alert now" in sent[1]["messages"][-1]["content"] and report.startswith("VERDICT")
+
+
+def test_connection_seen_before_the_kill_is_not_persisting(agent):  # noqa: F811
+    agent.detector.rules_execute = True
+    conn = {"remote_ip": "45.1.2.3", "remote_port": 443, "pid": 999999, "process": "curl"}
+    agent.detector.on_connection(conn)
+    (alert,) = _raise(agent, None, None)
+    asyncio.run(agent.process_approved())                    # the block runs (the kill of a gone PID is refused)
+    agent.db.save_resolution(alert["id"], "executed", "rules", "contained")
+    agent.detector.on_connection({**conn, "observed_at": 2e10})   # sampled history, process already gone
+    assert _raise(agent, None, None) == []                   # no "CONTAINED but persisting" alert

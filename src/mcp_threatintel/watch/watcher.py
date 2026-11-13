@@ -203,7 +203,7 @@ async def investigate_alert(mcp, alert: dict, args, toast: bool, responder: Resp
     out(f"    AI investigating alert #{alert_id} (Qwen)...")
     try:
         report, _more = await investigate(mcp, args.llm_url, text, timeout=args.llm_timeout,
-                                          ctx=getattr(args, "llm_context", None))
+                                          ctx=getattr(args, "llm_context", None), decide_alert=alert_id)
     except Exception as e:
         out(f"    AI failed on alert #{alert_id}: {e}")
         report = None

@@ -130,12 +130,14 @@ def openai_tools(mcp_tools) -> list[dict]:
 
 async def investigate(mcp, llm_url: str, findings_text: str, *, max_rounds: int = 6,
                       timeout: float = 300, transport: httpx.AsyncBaseTransport | None = None,
-                      ctx: int | None = None) -> tuple[str, list[dict]]:
-    """Run the tool loop in a fresh conversation. Returns (analysis text, actions the model requested)."""
+                      ctx: int | None = None, decide_alert: int | None = None) -> tuple[str, list[dict]]:
+    """Run the tool loop in a fresh conversation. Returns (analysis text, actions the model requested).
+    With ``decide_alert``, a model that answers without calling resolve_alert is asked once to do it."""
     _, per_result = budgets(ctx)
     tools = openai_tools(await mcp.list_tools())
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": findings_text}]
     actions: list[dict] = []
+    decided, nudged, report = decide_alert is None, False, ""
     async with httpx.AsyncClient(timeout=timeout, transport=transport) as http:
         for _ in range(max_rounds):
             resp = await http.post(f"{llm_url.rstrip('/')}/v1/chat/completions", json={
@@ -148,9 +150,19 @@ async def investigate(mcp, llm_url: str, findings_text: str, *, max_rounds: int 
             messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls} if calls
                             else {"role": "assistant", "content": msg.get("content") or ""})
             if not calls:
-                return (msg.get("content") or "").strip(), actions
+                report = report or (msg.get("content") or "").strip()
+                if decided or nudged:
+                    return report, actions
+                nudged = True   # small models often write the verdict and forget the decision
+                messages.append({"role": "user", "content":
+                                 f"You have not decided yet. Call resolve_alert now, exactly once, with "
+                                 f"alert_id={decide_alert}, decision execute, dismiss or escalate according to "
+                                 f"your verdict, and a one-sentence justification."})
+                continue
             for call in calls:
                 name = call["function"]["name"]
+                if name == "resolve_alert":
+                    decided = True
                 try:
                     args = json.loads(call["function"].get("arguments") or "{}")
                 except ValueError:
@@ -170,4 +182,4 @@ async def investigate(mcp, llm_url: str, findings_text: str, *, max_rounds: int 
                     except ValueError:
                         pass
                 messages.append({"role": "tool", "tool_call_id": call.get("id", name), "content": fit(text, per_result)})
-    return "(investigation stopped: too many tool calls)", actions
+    return report or "(investigation stopped: too many tool calls)", actions

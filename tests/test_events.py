@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import json
 import struct
 import time
@@ -187,11 +188,11 @@ def test_blocked_attempts_notify_once_then_count(agent):  # noqa: F811
         if act["type"] == "block_ip":
             agent.manager.approve(a, "analyst:alice")
             agent.manager.transition(a, "executed", "responder")
-    conn["connections"]["malicious"][0]["pid"] = 778      # malware retries from a new process
+    conn["connections"]["malicious"][0]["pid"] = os.getpid()   # malware retries from a new, running process
     [second] = eng.process_event(("report", conn))
     s2 = agent.db.get_alert(second)
     assert s2["incident_event"] == "persisting" and s2["title"].startswith("CONTAINED but persisting")
-    conn["connections"]["malicious"][0]["pid"] = 779
+    conn["connections"]["malicious"][0]["pid"] = os.getppid()
     assert eng.process_event(("report", conn)) == []        # later attempts only counted
     assert agent.db.get_incident(s2["incident_id"])["blocked_attempts"] >= 2
 

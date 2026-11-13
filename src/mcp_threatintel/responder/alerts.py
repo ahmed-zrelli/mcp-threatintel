@@ -68,6 +68,20 @@ def finding_keys(finding: Finding) -> set[str]:
     return keys
 
 
+def _still_running(detail: dict) -> bool:
+    """The connection is live now and its process (when known) still exists."""
+    if not detail.get("active", True):
+        return False
+    pid = detail.get("pid")
+    if pid:
+        import psutil
+        try:
+            return psutil.pid_exists(int(pid))
+        except (ValueError, TypeError):
+            return True
+    return True
+
+
 #: Detections the rules handle alone: threat-intel matches and unambiguous attack behavior.
 RULE_KINDS = {"c2_connection", "malicious_dns", "malicious_file", "malicious_process", "ssh_bruteforce",
               "ssh_login_from_malicious_ip", "ssh_attempt_from_malicious_ip", "port_scan", "reverse_shell"}
@@ -260,6 +274,12 @@ class AlertEngine:
         contained = bool(containing) and all(a.get("duplicate") and a.get("status") == "executed"
                                              for a in containing)
         # Only a connection means malware is still retrying; a sinkholed name never reaches DNS again.
+        # And only a LIVE connection from a process that still exists: a sampled connection seen just before
+        # the kill is history, not persistence.
+        if contained and finding.kind == "c2_connection" and not _still_running(finding.detail):
+            if prev:
+                self.db.bump_alert(prev["id"])
+            return None
         if contained and incident is not None and finding.kind == "c2_connection":
             self.db.update_incident(incident["id"], blocked_attempt=True)
             if incident["persisting_notified"]:
