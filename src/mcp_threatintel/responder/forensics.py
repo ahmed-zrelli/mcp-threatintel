@@ -18,7 +18,9 @@ Nothing is modified. Every list is capped so results fit a small model's context
 from __future__ import annotations
 
 import os
+import re
 import stat
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +48,12 @@ class Forensics:
         self.scanner = scanner
         self.iocs = scanner.iocs
         self.db = db
+
+    def change_origin(self, terms: list[str]) -> dict:
+        from .validators import Allowlist
+        cfg = getattr(self.scanner, "config", None)
+        return change_origin(terms, allowlist=Allowlist(self.db.load_allowlist()),
+                             admins=tuple(getattr(cfg, "protected_users", ()) or ()))
 
     # --- processes ----------------------------------------------------------
 
@@ -255,6 +263,64 @@ def _sniff(head: bytes) -> str:
         return "binary"
 
 
+_SUDO = re.compile(r"sudo\[\d+\]:\s+(\S+) : (?:.*?TTY=(\S+) ; )?.*?USER=(\S+) ; COMMAND=(.+)$")
+_FROM_TTY = re.compile(r"from=/dev/(\S+)")
+_ADMIN_TOOLS = ("sudo", "su", "useradd", "usermod", "userdel", "groupadd", "groupmod", "gpasswd", "passwd",
+                "chpasswd", "chsh", "adduser", "deluser")
+
+
+def _run(argv: list[str]) -> str:
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def change_origin(terms: list[str], *, allowlist=None, admins: tuple = (), minutes: int = 30,
+                  journal: str | None = None, logins: str | None = None) -> dict:
+    """Who made an account / system-file change: the matching admin-tool and sudo log lines, the user who
+    ran them, and the SSH login (IP) of that terminal. Facts only, from the system log and `last`."""
+    terms = [t for t in terms if t]
+    if journal is None:
+        args = ["journalctl", "--since", f"-{minutes}min", "-o", "short-iso", "--no-pager"]
+        for t in _ADMIN_TOOLS:
+            args += ["-t", t]
+        journal = _run(args)
+    if logins is None:
+        logins = _run(["last", "-i", "-w", "-n", "200"])
+    lines = [ln for ln in journal.splitlines() if any(t in ln for t in terms)]
+    tty_ip: dict[tuple, str] = {}
+    for ln in logins.splitlines():   # "ahmed pts/0 192.168.21.1 Fri Nov 13 08:30 still logged in"
+        f = ln.split()
+        if len(f) >= 3 and f[1].startswith(("pts/", "tty")):
+            tty_ip.setdefault((f[0], f[1]), f[2])
+            tty_ip.setdefault(("*", f[1]), f[2])
+    made_by = []
+    for ln in lines:
+        m = _SUDO.search(ln)
+        if m:
+            user, tty, as_user, cmd = m.group(1), (m.group(2) or "").replace("/dev/", ""), m.group(3), m.group(4)
+            entry = {"user": user, "via": f"sudo (as {as_user})", "tty": tty or None, "command": cmd[:200]}
+        else:
+            t = _FROM_TTY.search(ln)
+            if not t:
+                continue
+            entry = {"user": None, "via": ln.split(":", 1)[0].split()[-1].split("[")[0], "tty": t.group(1)}
+        ip = tty_ip.get((entry["user"] or "*", entry["tty"] or "")) or tty_ip.get(("*", entry["tty"] or ""))
+        entry["from_ip"] = None if ip in (None, "0.0.0.0", ":0") else ip
+        if entry["from_ip"] and allowlist is not None:
+            try:
+                entry["from_allowlisted"] = allowlist.check_ip(entry["from_ip"])
+            except ValueError:
+                entry["from_allowlisted"] = None
+        entry["known_admin"] = bool(entry["user"] and entry["user"] in admins and entry["user"] != "root")
+        if entry not in made_by:
+            made_by.append(entry)
+    note = None if made_by else ("no record of who made this change in the system log (direct file edit, "
+                                 "a process already running as root, or logs tampered with)")
+    return {"log_lines": [ln[:220] for ln in lines[-8:]], "made_by": made_by[:5], "note": note}
+
+
 def collect_evidence(fx: Forensics, kind: str, detail: dict) -> dict:
     """What an analyst would look at first for each alert type (captured at alert time)."""
     ev: dict = {}
@@ -286,4 +352,13 @@ def collect_evidence(fx: Forensics, kind: str, detail: dict) -> dict:
     elif kind.startswith("ssh_"):
         safe("ip", fx.ip_activity, detail.get("ip"))
         safe("campaign", fx.related_iocs, detail.get("ip"))
+    elif kind.startswith(("account_", "integrity_")):
+        # Who did it, from where: the deciding fact for a change an admin could also have made.
+        term = detail.get("user") or detail.get("path")
+        safe("change_origin", fx.change_origin, [term, detail.get("group")] if term else [])
+    elif kind in ("new_listener", "suspicious_process", "reverse_shell"):
+        if detail.get("pid"):
+            safe("process", fx.inspect_process, detail["pid"])
+        if detail.get("remote_ip"):
+            safe("ip", fx.ip_activity, detail["remote_ip"])
     return ev

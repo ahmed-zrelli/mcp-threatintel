@@ -187,3 +187,28 @@ def test_connection_seen_before_the_kill_is_not_persisting(agent):  # noqa: F811
     agent.db.save_resolution(alert["id"], "executed", "rules", "contained")
     agent.detector.on_connection({**conn, "observed_at": 2e10})   # sampled history, process already gone
     assert _raise(agent, None, None) == []                   # no "CONTAINED but persisting" alert
+
+
+JOURNAL = """2026-11-13T08:48:31+00:00 devsecops sudo[2128]:    ahmed : TTY=pts/1 ; PWD=/home/ahmed ; USER=root ; COMMAND=/usr/sbin/useradd -m -s /bin/bash labuser3
+2026-11-13T08:48:31+00:00 devsecops useradd[2130]: new user: name=labuser3, UID=1001, GID=1001, home=/home/labuser3, shell=/bin/bash, from=/dev/pts/1
+2026-11-13T08:48:40+00:00 devsecops sudo[2138]:    ahmed : TTY=pts/0 ; PWD=/home/ahmed ; USER=root ; COMMAND=/usr/sbin/usermod -aG sudo labuser3
+2026-11-13T08:48:40+00:00 devsecops usermod[2140]: add 'labuser3' to group 'sudo'
+2026-11-13T08:49:00+00:00 devsecops sudo[2150]:    bob : TTY=pts/3 ; PWD=/tmp ; USER=root ; COMMAND=/usr/sbin/useradd backdoor"""
+LAST = """ahmed    pts/1        192.168.21.1     Fri Nov 13 08:40   still logged in
+ahmed    pts/0        192.168.21.1     Fri Nov 13 08:30   still logged in
+bob      pts/3        203.0.113.9      Fri Nov 13 08:45   still logged in"""
+
+
+def test_change_origin_says_who_made_an_account_change():
+    from mcp_threatintel.responder.forensics import change_origin
+    from mcp_threatintel.responder.validators import Allowlist
+    allow = Allowlist([{"value": "192.168.21.1/32", "type": "cidr", "comment": "analyst PC"}])
+    ok = change_origin(["labuser3"], allowlist=allow, admins=("root", "ahmed"), journal=JOURNAL, logins=LAST)
+    sudo_runs = [m for m in ok["made_by"] if m["via"].startswith("sudo")]
+    assert sudo_runs and all(m["user"] == "ahmed" and m["known_admin"] and m["from_ip"] == "192.168.21.1"
+                             and m["from_allowlisted"] for m in sudo_runs)
+    bad = change_origin(["backdoor"], allowlist=allow, admins=("root", "ahmed"), journal=JOURNAL, logins=LAST)
+    (m,) = bad["made_by"]
+    assert m["user"] == "bob" and not m["known_admin"] and m["from_ip"] == "203.0.113.9" and not m["from_allowlisted"]
+    none = change_origin(["ghost"], journal=JOURNAL, logins=LAST)
+    assert none["made_by"] == [] and "no record" in none["note"]
