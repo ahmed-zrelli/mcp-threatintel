@@ -175,6 +175,16 @@ def test_package_installation_lowers_severity(tmp_path, monkeypatch):
     assert f.plan == []                                                      # nothing proposed
 
 
+def test_idle_unattended_upgrade_helper_is_not_a_package_install():
+    def proc(name, cmd):
+        return NS(info={"name": name, "cmdline": cmd.split()})
+    idle = proc("unattended-upgr", "/usr/bin/python3 /usr/share/unattended-upgrades/unattended-upgrade-shutdown "
+                                   "--wait-for-signal")
+    assert bh.package_manager_active([idle, proc("bash", "bash")]) is False
+    assert bh.package_manager_active([idle, proc("dpkg", "dpkg --configure -a")]) is True
+    assert bh.package_manager_active([proc("unattended-upgr", "/usr/bin/python3 /usr/bin/unattended-upgrade")])
+
+
 # --- findings and actions ----------------------------------------------------------
 
 

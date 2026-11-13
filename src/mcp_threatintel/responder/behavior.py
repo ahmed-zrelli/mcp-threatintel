@@ -378,10 +378,15 @@ def diff_integrity(old: dict, new: dict) -> list[dict]:
     return changes
 
 
-def package_manager_active() -> bool:
+def package_manager_active(procs=None) -> bool:
+    """apt/dpkg is installing something right now. Ubuntu's unattended-upgrade-shutdown helper
+    runs all the time (it only waits for shutdown) and does not count."""
     names = {"apt", "apt-get", "dpkg", "unattended-upgr", "unattended-upgrade", "aptitude"}
-    for p in psutil.process_iter(["name"]):
+    for p in procs if procs is not None else psutil.process_iter(["name", "cmdline"]):
         if (p.info.get("name") or "") in names:
+            cmd = " ".join(p.info.get("cmdline") or [])
+            if "unattended-upgrade-shutdown" in cmd:
+                continue
             return True
     return False
 
