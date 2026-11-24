@@ -1,4 +1,4 @@
-# mcp-threatintel v2: threat intelligence + autonomous response with a local LLM
+﻿# mcp-threatintel v2: threat intelligence + autonomous response with a local LLM
 
 A lightweight **SOAR** (Security Orchestration, Automation and Response) for a protected Ubuntu
 server. A host agent detects attacks 24/7 from threat feeds and from behavior. Deterministic rules
@@ -16,14 +16,14 @@ is validated, audited and reversible.
 
 ```
 Analyst PC (Windows)                                            Ubuntu server (protected)
-                                                                ─────────────────────────
+                                                                â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
  llama-server + WebUI (Qwen, :8080)                             threatintel-responder
-   │  HTTP 127.0.0.1:3707/mcp                                   (systemd, root, always on)
-   ▼                                                              detection 24/7:
- MCP server (28 tools) ──────── TLS :3712  agent channel ──────▶   feeds: C2, DNS, files,
- AI responder (Qwen decides) ──┘                                   command lines, SSH
- feed poller (abuse.ch, OTX, CISA) ── push intel ──(:3712)──────▶   behavior: port scans,
- dashboard 127.0.0.1:3720 ─────── TLS :3713  admin channel ──────▶   reverse shells, new ports,
+   â”‚  HTTP 127.0.0.1:3707/mcp                                   (systemd, root, always on)
+   â–¼                                                              detection 24/7:
+ MCP server (28 tools) â”€â”€â”€â”€â”€â”€â”€â”€ TLS :3712  agent channel â”€â”€â”€â”€â”€â”€â–¶   feeds: C2, DNS, files,
+ AI responder (Qwen decides) â”€â”€â”˜                                   command lines, SSH
+ feed poller (abuse.ch, OTX, CISA) â”€â”€ push intel â”€â”€(:3712)â”€â”€â”€â”€â”€â”€â–¶   behavior: port scans,
+ dashboard 127.0.0.1:3720 â”€â”€â”€â”€â”€â”€â”€ TLS :3713  admin channel â”€â”€â”€â”€â”€â”€â–¶   reverse shells, new ports,
                                                                     accounts, system files,
                                                                     SSH brute force
                                                                   responses: nftables block,
@@ -101,7 +101,7 @@ saves about 30% of the model's context with no information lost. Set `MCP_COMPAC
 ### 1. Server (once)
 
 ```bash
-git clone https://github.com/<your-account>/mcp-threatintel.git ~/mcp-threatintel
+git clone https://github.com/ahmed-zrelli/mcp-threatintel.git ~/mcp-threatintel
 cd ~/mcp-threatintel
 sudo ANALYST_IP=<analyst PC IP> bash scripts/ubuntu/setup-ubuntu.sh
 ```
@@ -120,7 +120,7 @@ sudo systemctl restart threatintel-responder
 ### 2. Analyst PC (once)
 
 ```powershell
-git clone https://github.com/<your-account>/mcp-threatintel.git
+git clone https://github.com/ahmed-zrelli/mcp-threatintel.git
 cd mcp-threatintel
 python -m venv .venv
 .venv\Scripts\pip install -e .
@@ -162,10 +162,10 @@ dashboard at `http://127.0.0.1:3720`. To chat with the model, open the WebUI at
 | Malicious domain | `getent hosts c2.threatintel-lab.test` | alert + `sinkhole_domain` |
 | C2 connection | `python3 ~/mcp-threatintel/lab/fake_c2_beacon.py` | CRITICAL + `kill_process` + `block_ip` |
 | Malicious file | `cp ~/threatintel-lab/invoice_2026.pdf.exe.txt /tmp/update.bin` | alert + `quarantine_file` |
-| Backdoor port | `python3 -m http.server 8770 &` | HIGH "new listening port" → AI decides |
-| New privileged account | `sudo useradd -m labuser2 && sudo usermod -aG sudo labuser2` | CRITICAL → `lock_user` |
-| Persistence | `echo '* * * * * root true' \| sudo tee /etc/cron.d/lab-test` | HIGH → `quarantine_file` |
-| Reverse-shell technique | `sh -c 'sleep 300; echo /dev/tcp/x' &` | HIGH → `kill_process` |
+| Backdoor port | `python3 -m http.server 8770 &` | HIGH "new listening port" â†’ AI decides |
+| New privileged account | `sudo useradd -m labuser2 && sudo usermod -aG sudo labuser2` | CRITICAL â†’ `lock_user` |
+| Persistence | `echo '* * * * * root true' \| sudo tee /etc/cron.d/lab-test` | HIGH â†’ `quarantine_file` |
+| Reverse-shell technique | `sh -c 'sleep 300; echo /dev/tcp/x' &` | HIGH â†’ `kill_process` |
 | SSH brute force | 6 wrong passwords from another host | alert + `block_ip` (the analyst PC is allowlisted) |
 
 Lab files are created with `python3 lab/create_test_files.py ~/threatintel-lab`. Proof on the
