@@ -19,7 +19,7 @@ import os
 import uvicorn
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-from pete_mcp_core import build_auth_provider, configure_logging, format_response
+from pete_mcp_core import build_auth_provider, configure_logging
 from pete_mcp_core.session_reaper import enable_session_reaper
 from pete_mcp_core.settings import BaseCoreSettings
 from pydantic import AliasChoices, Field, SecretStr
@@ -41,6 +41,7 @@ from mcp_threatintel.db import (
     get_db_stats,
 )
 from mcp_threatintel.responder.client import AgentError, HostAgentClient
+from mcp_threatintel.slim import to_json
 
 load_dotenv()
 
@@ -120,8 +121,8 @@ mcp = FastMCP(
 )
 
 
-# Alias so existing `_format(...)` call sites stay unchanged.
-_format = format_response
+# Compact, information-preserving JSON (see slim.py); MCP_COMPACT=0 restores the indented output.
+_format = to_json
 
 
 # --- Tool annotations ---
